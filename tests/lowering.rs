@@ -8,6 +8,6 @@ fn lowers_multiple_references_without_eating_punctuation() {
     let prompt = "Compare @model.rs::User with %notes.txt.";
     assert_eq!(
         tscodeselection::composer::resolve_prompt(temp.path(), prompt).unwrap(),
-        "Compare model.rs:1:12 with notes.txt."
+        "Compare model.rs::1:12 User with notes.txt."
     );
 }

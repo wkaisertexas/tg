@@ -44,7 +44,7 @@ The MVP must:
 - Complete useful non-local symbols after the file has been resolved.
 - Permit concise leaf-name references to nested symbols without requiring the
   full namespace or enclosing-type path.
-- Convert selected symbols to one-based `path:line:column` locations when the
+- Convert selected symbols to one-based `path::line:column SymbolName` locations when the
   user submits the prompt.
 - Show a scrollable source preview so the user can verify the selected
   location.
@@ -379,8 +379,8 @@ replaced independently:
 | --- | --- |
 | `@src/model.rs` | `src/model.rs` |
 | `%fixtures/output.py` | `fixtures/output.py` |
-| `@src/model.rs::User` | `src/model.rs:12:8` |
-| `%gen/case.cpp::Fixture` | `gen/case.cpp:41:3` |
+| `@src/model.rs::User` | `src/model.rs::12:8 User` |
+| `%gen/case.cpp::Fixture` | `gen/case.cpp::41:3 Fixture` |
 
 All paths are relative to the search root and use `/` separators. Lines and
 columns are one-based decimal integers. A symbol reference emits the selected
@@ -396,7 +396,7 @@ Composer:
 Compare @src/old.rs::Parser with %generated/new_parser.cpp::Parser.
 
 Standard output:
-Compare src/old.rs:18:12 with generated/new_parser.cpp:73:7.
+Compare src/old.rs::18:12 Parser with generated/new_parser.cpp::73:7 Parser.
 ```
 
 ### 10.3 Validation at Submission
@@ -565,7 +565,7 @@ The MVP is complete when all of the following can be demonstrated:
 9. Selecting a symbol shows its file path and a scrollable preview initially
    containing five lines before and five lines after its declaration line.
 10. Submitting a prompt converts symbol tokens to one-based
-    `path:line:column`, converts file-only tokens to paths, preserves surrounding
+    `path::line:column SymbolName`, converts file-only tokens to paths, preserves surrounding
     prompt text, and writes one unescaped line to standard output.
 11. Editing a referenced file before submission triggers re-resolution or
     blocks submission rather than emitting a stale location.

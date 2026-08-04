@@ -266,7 +266,7 @@ Each language fixture should contain:
 - Implement lowering as a pure operation over composer text and structured
   reference spans.
 - Convert file-only references to relative paths.
-- Convert symbol references to one-based `path:line:column`.
+- Convert symbol references to one-based `path::line:column SymbolName`.
 - Preserve all non-reference text.
 - Validate file existence and metadata immediately before submission.
 - Reparse stale symbol files and attempt to identify the selected declaration
@@ -351,7 +351,7 @@ would dominate implementation effort.
 9. Scroll beyond the initial preview window.
 10. Compose a sentence containing both a file-only and a symbol reference.
 11. Submit and confirm stdout contains the expected plain paths and
-    `path:line:column` value with no control sequences or escaping.
+    `path::line:column SymbolName` value with no control sequences or escaping.
 12. Submit a second prompt without restarting the application.
 13. Modify a selected source file before submission and confirm re-resolution
     or an actionable stale-reference state.

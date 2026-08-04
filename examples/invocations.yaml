@@ -57,8 +57,8 @@ cases:
       line: 109
       column: 7
     expected:
-      lowered_reference: corpus/python/flask/src/flask/app.py:109:7
-      stdout: "Inspect corpus/python/flask/src/flask/app.py:109:7\n"
+      lowered_reference: corpus/python/flask/src/flask/app.py::109:7 Flask
+      stdout: "Inspect corpus/python/flask/src/flask/app.py::109:7 Flask\n"
       preview:
         header: corpus/python/flask/src/flask/app.py
         focus_line: 109
@@ -80,8 +80,8 @@ cases:
       line: 632
       column: 9
     expected:
-      lowered_reference: corpus/python/flask/src/flask/app.py:632:9
-      stdout: "Explain startup behavior in corpus/python/flask/src/flask/app.py:632:9\n"
+      lowered_reference: corpus/python/flask/src/flask/app.py::632:9 run
+      stdout: "Explain startup behavior in corpus/python/flask/src/flask/app.py::632:9 run\n"
       preview:
         header: corpus/python/flask/src/flask/app.py
         focus_line: 632
@@ -102,8 +102,8 @@ cases:
       line: 18
       column: 7
     expected:
-      lowered_reference: corpus/python/flask/src/flask/blueprints.py:18:7
-      stdout: "Review corpus/python/flask/src/flask/blueprints.py:18:7\n"
+      lowered_reference: corpus/python/flask/src/flask/blueprints.py::18:7 Blueprint
+      stdout: "Review corpus/python/flask/src/flask/blueprints.py::18:7 Blueprint\n"
       preview:
         header: corpus/python/flask/src/flask/blueprints.py
         focus_line: 18
@@ -124,8 +124,8 @@ cases:
       line: 24
       column: 5
     expected:
-      lowered_reference: corpus/python/requests/src/requests/api.py:24:5
-      stdout: "Trace corpus/python/requests/src/requests/api.py:24:5\n"
+      lowered_reference: corpus/python/requests/src/requests/api.py::24:5 request
+      stdout: "Trace corpus/python/requests/src/requests/api.py::24:5 request\n"
       preview:
         header: corpus/python/requests/src/requests/api.py
         focus_line: 24
@@ -146,8 +146,8 @@ cases:
       line: 732
       column: 7
     expected:
-      lowered_reference: corpus/python/requests/src/requests/models.py:732:7
-      stdout: "Check response handling in corpus/python/requests/src/requests/models.py:732:7\n"
+      lowered_reference: corpus/python/requests/src/requests/models.py::732:7 Response
+      stdout: "Check response handling in corpus/python/requests/src/requests/models.py::732:7 Response\n"
       preview:
         header: corpus/python/requests/src/requests/models.py
         focus_line: 732
@@ -168,8 +168,8 @@ cases:
       line: 521
       column: 32
     expected:
-      lowered_reference: corpus/cpp/fmt/include/fmt/base.h:521:32
-      stdout: "Inspect corpus/cpp/fmt/include/fmt/base.h:521:32\n"
+      lowered_reference: corpus/cpp/fmt/include/fmt/base.h::521:32 basic_string_view
+      stdout: "Inspect corpus/cpp/fmt/include/fmt/base.h::521:32 basic_string_view\n"
       preview:
         header: corpus/cpp/fmt/include/fmt/base.h
         focus_line: 521
@@ -190,8 +190,8 @@ cases:
       line: 1066
       column: 52
     expected:
-      lowered_reference: corpus/cpp/fmt/include/fmt/base.h:1066:52
-      stdout: "Explain corpus/cpp/fmt/include/fmt/base.h:1066:52\n"
+      lowered_reference: corpus/cpp/fmt/include/fmt/base.h::1066:52 named_arg
+      stdout: "Explain corpus/cpp/fmt/include/fmt/base.h::1066:52 named_arg\n"
       preview:
         header: corpus/cpp/fmt/include/fmt/base.h
         focus_line: 1066
@@ -212,8 +212,8 @@ cases:
       line: 127
       column: 7
     expected:
-      lowered_reference: corpus/cpp/json/include/nlohmann/json.hpp:127:7
-      stdout: "Review corpus/cpp/json/include/nlohmann/json.hpp:127:7\n"
+      lowered_reference: corpus/cpp/json/include/nlohmann/json.hpp::127:7 basic_json
+      stdout: "Review corpus/cpp/json/include/nlohmann/json.hpp::127:7 basic_json\n"
       preview:
         header: corpus/cpp/json/include/nlohmann/json.hpp
         focus_line: 127
@@ -234,8 +234,8 @@ cases:
       line: 35
       column: 7
     expected:
-      lowered_reference: corpus/cpp/json/include/nlohmann/detail/json_pointer.hpp:35:7
-      stdout: "Trace corpus/cpp/json/include/nlohmann/detail/json_pointer.hpp:35:7\n"
+      lowered_reference: corpus/cpp/json/include/nlohmann/detail/json_pointer.hpp::35:7 json_pointer
+      stdout: "Trace corpus/cpp/json/include/nlohmann/detail/json_pointer.hpp::35:7 json_pointer\n"
       preview:
         header: corpus/cpp/json/include/nlohmann/detail/json_pointer.hpp
         focus_line: 35
@@ -256,8 +256,8 @@ cases:
       line: 134
       column: 7
     expected:
-      lowered_reference: corpus/cpp/json/include/nlohmann/detail/input/lexer.hpp:134:7
-      stdout: "Check tokenization in corpus/cpp/json/include/nlohmann/detail/input/lexer.hpp:134:7\n"
+      lowered_reference: corpus/cpp/json/include/nlohmann/detail/input/lexer.hpp::134:7 lexer
+      stdout: "Check tokenization in corpus/cpp/json/include/nlohmann/detail/input/lexer.hpp::134:7 lexer\n"
       preview:
         header: corpus/cpp/json/include/nlohmann/detail/input/lexer.hpp
         focus_line: 134

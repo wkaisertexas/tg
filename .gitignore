@@ -1,2 +1,5 @@
 /corpus/
 /target/
+
+.envrc
+/result

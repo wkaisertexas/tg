@@ -1,5 +1,4 @@
 use crate::language::{self, ParsedFile, Symbol};
-use crate::preview;
 use crate::repository::Repository;
 use crate::search::{self, FileMatch, SearchMode};
 use anyhow::Result;
@@ -40,6 +39,8 @@ struct App {
     parsed: Option<(String, ParsedFile)>,
     status: String,
     preview_scroll: usize,
+    transcript: Vec<String>,
+    transcript_scroll: usize,
     resolutions: Vec<ResolvedSpan>,
 }
 
@@ -67,6 +68,8 @@ impl App {
             parsed: None,
             status,
             preview_scroll: 0,
+            transcript: Vec::new(),
+            transcript_scroll: 0,
             resolutions: Vec::new(),
         }
     }
@@ -117,9 +120,10 @@ impl App {
                     .map(Candidate::Symbol)
                     .collect();
                 self.status = format!(
-                    "SYMBOLS · {} matches · Enter selects",
+                    "SYMBOLS · {} matches · Tab/Enter selects",
                     self.candidates.len()
                 );
+                self.center_preview();
             }
         } else {
             let (mode, files) = if sigil == '@' {
@@ -162,7 +166,10 @@ impl App {
                 let file = prefix[1..].to_owned();
                 (
                     format!("{prefix}::{}", symbol.leaf_name),
-                    format!("{file}:{}:{}", symbol.start.line, symbol.start.column),
+                    format!(
+                        "{file}::{}:{} {}",
+                        symbol.start.line, symbol.start.column, symbol.leaf_name
+                    ),
                     self.repo.search_root.join(file),
                 )
             }
@@ -192,8 +199,8 @@ impl App {
         let result = self.lower_resolved();
         match result {
             Ok(lowered) => {
-                let _ = writeln!(io::stdout(), "{lowered}");
-                let _ = io::stdout().flush();
+                self.transcript.push(lowered);
+                self.transcript_scroll = self.transcript.len().saturating_sub(3);
                 self.text.clear();
                 self.accepted = None;
                 self.parsed = None;
@@ -215,6 +222,13 @@ impl App {
             lowered.replace_range(span.start..span.end, &span.lowered);
         }
         Ok(lowered)
+    }
+
+    fn center_preview(&mut self) {
+        self.preview_scroll = match self.candidates.get(self.selected) {
+            Some(Candidate::Symbol(symbol)) => centered_preview_scroll(symbol.start.line),
+            _ => 0,
+        };
     }
 
     fn key(&mut self, key: KeyEvent) -> bool {
@@ -242,13 +256,22 @@ impl App {
             }
         }
         match key.code {
-            KeyCode::Enter if !self.candidates.is_empty() => self.accept(),
+            code if !self.candidates.is_empty() && is_completion_accept_key(code) => self.accept(),
             KeyCode::Enter => self.submit(),
             KeyCode::Up if !self.candidates.is_empty() => {
-                self.selected = self.selected.saturating_sub(1)
+                self.selected = self.selected.saturating_sub(1);
+                self.center_preview();
             }
             KeyCode::Down if !self.candidates.is_empty() => {
-                self.selected = (self.selected + 1).min(self.candidates.len() - 1)
+                self.selected = (self.selected + 1).min(self.candidates.len() - 1);
+                self.center_preview();
+            }
+            KeyCode::PageUp if self.candidates.is_empty() => {
+                self.transcript_scroll = self.transcript_scroll.saturating_sub(3)
+            }
+            KeyCode::PageDown if self.candidates.is_empty() => {
+                self.transcript_scroll =
+                    (self.transcript_scroll + 3).min(self.transcript.len().saturating_sub(1))
             }
             KeyCode::PageUp => self.preview_scroll = self.preview_scroll.saturating_sub(5),
             KeyCode::PageDown => self.preview_scroll += 5,
@@ -281,7 +304,6 @@ fn preview_lines(app: &App) -> Vec<Line<'static>> {
             .map(|source| {
                 source
                     .lines()
-                    .take(40)
                     .enumerate()
                     .map(|(i, line)| Line::from(format!("{:>5} │ {}", i + 1, line)))
                     .collect()
@@ -291,9 +313,12 @@ fn preview_lines(app: &App) -> Vec<Line<'static>> {
             .parsed
             .as_ref()
             .map(|(_, parsed)| {
-                preview::window(parsed, symbol, 5)
-                    .into_iter()
-                    .map(|(number, line)| {
+                parsed
+                    .source
+                    .lines()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        let number = index + 1;
                         let style = if number == symbol.start.line {
                             Style::default().fg(Color::Black).bg(Color::LightYellow)
                         } else {
@@ -316,6 +341,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Min(8),
             Constraint::Length(5),
             Constraint::Length(2),
@@ -339,10 +365,31 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     ]))
     .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, vertical[0]);
+    let transcript: Vec<_> = app
+        .transcript
+        .iter()
+        .map(|line| {
+            Line::from(vec![
+                Span::styled("› ", Style::default().fg(Color::Cyan)),
+                Span::raw(line.clone()),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(transcript)
+            .scroll((app.transcript_scroll as u16, 0))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Transcript · PgUp/PgDn when idle ")
+                    .borders(Borders::ALL),
+            ),
+        vertical[1],
+    );
     let middle = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(vertical[1]);
+        .split(vertical[2]);
     let items: Vec<_> = app
         .candidates
         .iter()
@@ -381,10 +428,9 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(preview_lines(app))
             .scroll((app.preview_scroll as u16, 0))
-            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
-                    .title(" Preview · PgUp/PgDn ")
+                    .title(" Preview · PgUp/PgDn · long lines clipped ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
             ),
@@ -395,15 +441,15 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
-                    .title(" Prompt · Enter selects/submits · Ctrl-J always submits ")
+                    .title(" Prompt · Tab/Enter completes · Enter submits · Ctrl-J always submits ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
             ),
-        vertical[2],
+        vertical[3],
     );
     frame.render_widget(
         Paragraph::new(format!(" {}", app.status)).style(Style::default().fg(Color::DarkGray)),
-        vertical[3],
+        vertical[4],
     );
 }
 
@@ -413,7 +459,7 @@ pub fn run(repo: Repository) -> Result<()> {
     execute!(stderr, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = Terminal::new(backend)?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<Vec<String>> {
         let mut app = App::new(repo);
         loop {
             terminal.draw(|frame| draw(frame, &app))?;
@@ -424,14 +470,45 @@ pub fn run(repo: Repository) -> Result<()> {
                 break;
             }
         }
-        Ok(())
+        Ok(app.transcript)
     })();
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-    result
+    let transcript = result?;
+    for line in transcript {
+        writeln!(io::stdout(), "{line}")?;
+    }
+    io::stdout().flush()?;
+    Ok(())
 }
 
 pub fn is_terminal() -> bool {
     crossterm::tty::IsTty::is_tty(&io::stdin())
+}
+
+fn is_completion_accept_key(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Tab | KeyCode::Enter)
+}
+
+fn centered_preview_scroll(one_based_line: usize) -> usize {
+    one_based_line.saturating_sub(6)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_and_enter_accept_completions() {
+        assert!(is_completion_accept_key(KeyCode::Tab));
+        assert!(is_completion_accept_key(KeyCode::Enter));
+        assert!(!is_completion_accept_key(KeyCode::Char('x')));
+    }
+
+    #[test]
+    fn preview_starts_five_lines_before_the_symbol() {
+        assert_eq!(centered_preview_scroll(109), 103);
+        assert_eq!(centered_preview_scroll(3), 0);
+    }
 }

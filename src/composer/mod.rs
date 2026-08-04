@@ -41,8 +41,8 @@ pub fn resolve_prompt(search_root: &Path, prompt: &str) -> Result<String> {
                         .context("symbol completion is unavailable for this file")?;
                     let selected = language::resolve_unique(&parsed.symbols, query)?;
                     output.push_str(&format!(
-                        ":{}:{}",
-                        selected.start.line, selected.start.column
+                        "::{}:{} {}",
+                        selected.start.line, selected.start.column, selected.leaf_name
                     ));
                 }
                 index = end;
