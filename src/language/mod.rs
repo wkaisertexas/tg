@@ -1,6 +1,11 @@
 use anyhow::{Context, Result};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
+use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::cell::RefCell;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use tree_sitter::{Language, Node, Parser, Point};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +38,30 @@ pub struct Symbol {
 pub struct ParsedFile {
     pub source: String,
     pub symbols: Vec<Symbol>,
+}
+
+pub struct SymbolParser {
+    parser: Parser,
+    flavor: Option<Flavor>,
+}
+
+impl SymbolParser {
+    pub fn new() -> Self {
+        Self {
+            parser: Parser::new(),
+            flavor: None,
+        }
+    }
+
+    pub fn parse(&mut self, path: &Path) -> Result<Option<ParsedFile>> {
+        parse_with_parser(path, &mut self.parser, &mut self.flavor)
+    }
+}
+
+impl Default for SymbolParser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub fn display_name(symbol: &Symbol) -> String {
@@ -89,7 +118,7 @@ pub fn names_equivalent(left: &str, right: &str) -> bool {
     normalize(left) == normalize(right)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Flavor {
     C,
     Cpp,
@@ -115,6 +144,14 @@ pub fn supports(path: &Path) -> bool {
 }
 
 pub fn parse(path: &Path) -> Result<Option<ParsedFile>> {
+    SymbolParser::new().parse(path)
+}
+
+fn parse_with_parser(
+    path: &Path,
+    parser: &mut Parser,
+    current_flavor: &mut Option<Flavor>,
+) -> Result<Option<ParsedFile>> {
     if is_markdown(path) {
         let bytes = std::fs::read(path)?;
         let source = String::from_utf8(bytes).context("source is not valid UTF-8")?;
@@ -126,8 +163,10 @@ pub fn parse(path: &Path) -> Result<Option<ParsedFile>> {
     };
     let bytes = std::fs::read(path)?;
     let source = String::from_utf8(bytes).context("source is not valid UTF-8")?;
-    let mut parser = Parser::new();
-    parser.set_language(&language)?;
+    if *current_flavor != Some(flavor) {
+        parser.set_language(&language)?;
+        *current_flavor = Some(flavor);
+    }
     let tree = parser
         .parse(&source, None)
         .context("Tree-sitter could not parse the file")?;
@@ -136,14 +175,58 @@ pub fn parse(path: &Path) -> Result<Option<ParsedFile>> {
         tree.root_node(),
         source.as_bytes(),
         flavor,
-        &[],
+        &mut Vec::new(),
         &mut symbols,
     );
-    if matches!(flavor, Flavor::Cpp | Flavor::C) {
-        supplement_c_family_declarations(&source, &mut symbols);
+    symbols.sort_unstable_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
+    if matches!(flavor, Flavor::Cpp | Flavor::C)
+        && supplement_c_family_declarations(&source, &mut symbols)
+    {
+        symbols.sort_unstable_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
     }
-    symbols.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
     Ok(Some(ParsedFile { source, symbols }))
+}
+
+pub fn index_symbols_parallel(paths: &[PathBuf]) -> Vec<Symbol> {
+    install_indexing(|| {
+        paths
+            .par_iter()
+            .map(|path| {
+                parse_indexed(path)
+                    .ok()
+                    .flatten()
+                    .map(|parsed| parsed.symbols)
+                    .unwrap_or_default()
+            })
+            .flatten()
+            .collect()
+    })
+}
+
+thread_local! {
+    static INDEX_PARSER: RefCell<SymbolParser> = RefCell::new(SymbolParser::new());
+}
+
+pub fn parse_indexed(path: &Path) -> Result<Option<ParsedFile>> {
+    INDEX_PARSER.with(|parser| parser.borrow_mut().parse(path))
+}
+
+pub fn install_indexing<R: Send>(operation: impl FnOnce() -> R + Send) -> R {
+    static INDEX_POOL: OnceLock<ThreadPool> = OnceLock::new();
+    INDEX_POOL
+        .get_or_init(|| {
+            let worker_count = std::thread::available_parallelism()
+                .map_or(4, usize::from)
+                .saturating_mul(4)
+                .min(56);
+            ThreadPoolBuilder::new()
+                .num_threads(worker_count)
+                .thread_name(|index| format!("tg-index-{index}"))
+                .stack_size(8 * 1024 * 1024)
+                .build()
+                .expect("could not create symbol indexing workers")
+        })
+        .install(operation)
 }
 
 fn is_markdown(path: &Path) -> bool {
@@ -285,9 +368,13 @@ fn classification(
     Some(result)
 }
 
-fn supplement_c_family_declarations(source: &str, symbols: &mut Vec<Symbol>) {
-    let declaration =
-        regex::Regex::new(r"\b(class|struct|union|enum)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+fn supplement_c_family_declarations(source: &str, symbols: &mut Vec<Symbol>) -> bool {
+    static DECLARATION: OnceLock<regex::Regex> = OnceLock::new();
+    let declaration = DECLARATION.get_or_init(|| {
+        regex::Regex::new(r"\b(class|struct|union|enum)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap()
+    });
+    let original_len = symbols.len();
+    let mut added_offsets = Vec::new();
     let mut byte_offset = 0;
     for (row, line) in source.split_inclusive('\n').enumerate() {
         let trimmed = line.trim_start();
@@ -295,19 +382,23 @@ fn supplement_c_family_declarations(source: &str, symbols: &mut Vec<Symbol>) {
             for captures in declaration.captures_iter(line) {
                 let whole = captures.get(0).unwrap();
                 let name = captures.get(2).unwrap();
-                // Ignore template parameter declarations such as `template<class T>`.
                 if line[..whole.start()].trim_end().ends_with("template<") {
                     continue;
                 }
                 let start_byte = byte_offset + name.start();
                 let name_end = byte_offset + name.end();
-                if symbols.iter().any(|symbol| symbol.start_byte == start_byte) {
+                if symbols[..original_len]
+                    .binary_search_by_key(&start_byte, |symbol| symbol.start_byte)
+                    .is_ok()
+                    || added_offsets.contains(&start_byte)
+                {
                     continue;
                 }
+                added_offsets.push(start_byte);
                 let kind = captures.get(1).unwrap().as_str();
-                let tail = &source[name_end..(name_end + 500).min(source.len())];
-                let brace = tail.find('{');
-                let semicolon = tail.find(';');
+                let tail = &source.as_bytes()[name_end..(name_end + 500).min(source.len())];
+                let brace = tail.iter().position(|byte| *byte == b'{');
+                let semicolon = tail.iter().position(|byte| *byte == b';');
                 symbols.push(Symbol {
                     leaf_name: name.as_str().to_owned(),
                     qualified_name: name.as_str().to_owned(),
@@ -325,6 +416,7 @@ fn supplement_c_family_declarations(source: &str, symbols: &mut Vec<Symbol>) {
         }
         byte_offset += line.len();
     }
+    !added_offsets.is_empty()
 }
 
 fn is_scope(kind: &str) -> bool {
@@ -370,25 +462,37 @@ fn unwrap_identifier(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).find_map(unwrap_identifier)
 }
 
-fn visit(node: Node<'_>, source: &[u8], flavor: Flavor, scopes: &[String], out: &mut Vec<Symbol>) {
+fn visit(
+    node: Node<'_>,
+    source: &[u8],
+    flavor: Flavor,
+    scopes: &mut Vec<String>,
+    out: &mut Vec<Symbol>,
+) {
     let inside_type = !scopes.is_empty();
-    let mut child_scopes = scopes.to_vec();
+    let original_scope_len = scopes.len();
     if node.kind() == "impl_item"
         && let Some(type_node) = node.child_by_field_name("type").and_then(unwrap_identifier)
         && let Ok(name) = type_node.utf8_text(source)
     {
-        child_scopes.push(name.to_owned());
+        scopes.push(name.to_owned());
     }
     if let Some((symbol_kind, field)) = classification(node.kind(), flavor, inside_type)
         && let Some(name_node) = identifier(node, field)
         && let Ok(name) = name_node.utf8_text(source)
         && !name.is_empty()
     {
-        let mut qualified = scopes.to_vec();
-        qualified.push(name.to_owned());
+        let qualified_name = if scopes.is_empty() {
+            name.to_owned()
+        } else {
+            let mut qualified = scopes.join("::");
+            qualified.push_str("::");
+            qualified.push_str(name);
+            qualified
+        };
         out.push(Symbol {
             leaf_name: name.to_owned(),
-            qualified_name: qualified.join("::"),
+            qualified_name,
             kind: symbol_kind.to_owned(),
             start: name_node.start_position().into(),
             start_byte: name_node.start_byte(),
@@ -400,13 +504,18 @@ fn visit(node: Node<'_>, source: &[u8], flavor: Flavor, scopes: &[String], out: 
                 ),
         });
         if is_scope(node.kind()) {
-            child_scopes.push(name.to_owned());
+            scopes.push(name.to_owned());
         }
+    }
+    if matches!(node.kind(), "function_definition" | "function_item") {
+        scopes.truncate(original_scope_len);
+        return;
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        visit(child, source, flavor, &child_scopes, out);
+        visit(child, source, flavor, scopes, out);
     }
+    scopes.truncate(original_scope_len);
 }
 
 pub fn find_symbols<'a>(symbols: &'a [Symbol], query: &str) -> Vec<&'a Symbol> {

@@ -25,3 +25,15 @@ fmt:
 
 nix-build:
     nix build
+
+bench-prepare:
+    mkdir -p benchmarks/corpus
+    test -d benchmarks/corpus/rust/.git || git clone --depth 1 https://github.com/rust-lang/rust.git benchmarks/corpus/rust
+    test -d benchmarks/corpus/llvm-project/.git || git clone --depth 1 https://github.com/llvm/llvm-project.git benchmarks/corpus/llvm-project
+    test -d benchmarks/corpus/ansible/.git || git clone --depth 1 https://github.com/ansible/ansible.git benchmarks/corpus/ansible
+
+bench:
+    cargo bench --bench repository
+
+bench-quick:
+    TG_BENCH_FILE_LIMIT=250 cargo bench --bench repository

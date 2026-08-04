@@ -1,5 +1,6 @@
 /corpus/
 /target/
 
-.envrc
 /result
+/benchmarks/corpus/
+/target/criterion/

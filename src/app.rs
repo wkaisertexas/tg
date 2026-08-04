@@ -2,6 +2,7 @@ use crate::language::{self, ParsedFile, Symbol};
 use crate::repository::Repository;
 use crate::search::{self, FileMatch, SearchMode};
 use anyhow::Result;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -14,16 +15,18 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use rayon::prelude::*;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 struct RepositorySymbol {
-    relative: String,
-    path: PathBuf,
+    relative: Arc<str>,
+    path: Arc<PathBuf>,
     symbol: Symbol,
 }
 
@@ -34,8 +37,10 @@ enum Candidate {
 }
 
 enum IndexMessage {
-    Symbols(Vec<RepositorySymbol>),
-    Progress(usize),
+    Batch {
+        symbols: Vec<RepositorySymbol>,
+        scanned: usize,
+    },
     Done,
 }
 
@@ -66,6 +71,7 @@ struct App {
     index_scanned: usize,
     index_total: usize,
     index_done: bool,
+    pending_clipboard: Option<String>,
 }
 
 impl App {
@@ -101,6 +107,7 @@ impl App {
             index_scanned: 0,
             index_total: 0,
             index_done: false,
+            pending_clipboard: None,
         }
     }
 
@@ -200,30 +207,35 @@ impl App {
         let (sender, receiver) = mpsc::channel();
         self.index_receiver = Some(receiver);
         thread::spawn(move || {
-            for (index, path) in files.into_iter().enumerate() {
-                if let Ok(Some(parsed)) = language::parse(&path) {
-                    let relative = path
-                        .strip_prefix(&root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    let symbols = parsed
-                        .symbols
-                        .into_iter()
-                        .map(|symbol| RepositorySymbol {
-                            relative: relative.clone(),
-                            path: path.clone(),
-                            symbol,
-                        })
-                        .collect();
-                    if sender.send(IndexMessage::Symbols(symbols)).is_err() {
-                        return;
-                    }
-                }
-                if sender.send(IndexMessage::Progress(index + 1)).is_err() {
-                    return;
-                }
-            }
+            language::install_indexing(|| {
+                files
+                    .par_chunks(64)
+                    .for_each_with(sender.clone(), |sender, paths| {
+                        let mut symbols = Vec::new();
+                        for path in paths {
+                            if let Ok(Some(parsed)) = language::parse_indexed(path) {
+                                let relative: Arc<str> = path
+                                    .strip_prefix(&root)
+                                    .unwrap_or(path)
+                                    .to_string_lossy()
+                                    .replace('\\', "/")
+                                    .into();
+                                let path = Arc::new(path.clone());
+                                symbols.extend(parsed.symbols.into_iter().map(|symbol| {
+                                    RepositorySymbol {
+                                        relative: Arc::clone(&relative),
+                                        path: Arc::clone(&path),
+                                        symbol,
+                                    }
+                                }));
+                            }
+                        }
+                        let _ = sender.send(IndexMessage::Batch {
+                            symbols,
+                            scanned: paths.len(),
+                        });
+                    });
+            });
             let _ = sender.send(IndexMessage::Done);
         });
     }
@@ -234,11 +246,11 @@ impl App {
         if let Some(receiver) = &self.index_receiver {
             while let Ok(message) = receiver.try_recv() {
                 match message {
-                    IndexMessage::Symbols(symbols) => {
+                    IndexMessage::Batch { symbols, scanned } => {
                         self.repository_symbols.extend(symbols);
+                        self.index_scanned += scanned;
                         changed = true;
                     }
-                    IndexMessage::Progress(scanned) => self.index_scanned = scanned,
                     IndexMessage::Done => {
                         self.index_done = true;
                         finished = true;
@@ -312,8 +324,8 @@ impl App {
                     candidate.relative,
                     language::display_name(&candidate.symbol)
                 ),
-                language::lowered_reference(&candidate.relative, &candidate.symbol),
-                candidate.path.clone(),
+                language::lowered_reference(candidate.relative.as_ref(), &candidate.symbol),
+                candidate.path.as_ref().clone(),
             ),
         };
         let start = self.text.len() - old_token.len();
@@ -341,14 +353,15 @@ impl App {
         let result = self.lower_resolved();
         match result {
             Ok(lowered) => {
-                self.transcript.push(lowered);
+                self.transcript.push(lowered.clone());
+                self.pending_clipboard = Some(lowered);
                 self.transcript_scroll = self.transcript.len().saturating_sub(3);
                 self.text.clear();
                 self.accepted = None;
                 self.parsed = None;
                 self.candidates.clear();
                 self.resolutions.clear();
-                self.status = "Submitted ✓ · ready for another prompt".into();
+                self.status = "Submitted ✓ · copied with OSC 52 · ready for another prompt".into();
             }
             Err(error) => self.status = format!("Cannot submit: {error}"),
         }
@@ -474,9 +487,11 @@ fn preview_lines(app: &App) -> Vec<Line<'static>> {
                     .collect()
             })
             .unwrap_or_default(),
-        Some(Candidate::RepositorySymbol(candidate)) => std::fs::read_to_string(&candidate.path)
-            .map(|source| highlighted_source_lines(&source, &candidate.symbol))
-            .unwrap_or_else(|_| vec![Line::from("Preview unavailable")]),
+        Some(Candidate::RepositorySymbol(candidate)) => {
+            std::fs::read_to_string(candidate.path.as_ref())
+                .map(|source| highlighted_source_lines(&source, &candidate.symbol))
+                .unwrap_or_else(|_| vec![Line::from("Preview unavailable")])
+        }
         None => vec![
             Line::from("Type @ for files, % for ignored files, or :: for all symbols."),
             Line::from("After a symbol or Markdown heading, type . for children."),
@@ -529,12 +544,18 @@ fn rank_repository_symbols(index: &[RepositorySymbol], query: &str) -> Vec<Repos
             Some((score, candidate))
         })
         .collect();
-    matches.sort_by(|(left_score, left), (right_score, right)| {
+    let compare = |(left_score, left): &(i64, &RepositorySymbol),
+                   (right_score, right): &(i64, &RepositorySymbol)| {
         right_score
             .cmp(left_score)
             .then_with(|| left.relative.cmp(&right.relative))
             .then_with(|| left.symbol.start.line.cmp(&right.symbol.start.line))
-    });
+    };
+    if matches.len() > 100 {
+        matches.select_nth_unstable_by(100, compare);
+        matches.truncate(100);
+    }
+    matches.sort_by(compare);
     matches
         .into_iter()
         .take(100)
@@ -702,9 +723,15 @@ pub fn run(repo: Repository) -> Result<()> {
             };
             if let Some(Event::Key(key)) = next_event
                 && key.kind == crossterm::event::KeyEventKind::Press
-                && app.key(key)
             {
-                break;
+                let should_exit = app.key(key);
+                if let Some(text) = app.pending_clipboard.take() {
+                    write!(terminal.backend_mut(), "{}", osc52_sequence(&text))?;
+                    terminal.backend_mut().flush()?;
+                }
+                if should_exit {
+                    break;
+                }
             }
         }
         Ok(app.transcript)
@@ -732,6 +759,10 @@ fn centered_preview_scroll(one_based_line: usize) -> usize {
     one_based_line.saturating_sub(6)
 }
 
+fn osc52_sequence(text: &str) -> String {
+    format!("\u{1b}]52;c;{}\u{7}", BASE64.encode(text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,7 +784,7 @@ mod tests {
     fn repository_symbol_search_prefers_exact_leaf_names() {
         let candidate = |name: &str| RepositorySymbol {
             relative: "src/lib.rs".into(),
-            path: PathBuf::from("src/lib.rs"),
+            path: Arc::new(PathBuf::from("src/lib.rs")),
             symbol: Symbol {
                 leaf_name: name.into(),
                 qualified_name: name.into(),
@@ -767,5 +798,13 @@ mod tests {
         let index = [candidate("renderer"), candidate("render")];
         let matches = rank_repository_symbols(&index, "render");
         assert_eq!(matches[0].symbol.leaf_name, "render");
+    }
+
+    #[test]
+    fn osc52_encodes_the_lowered_prompt() {
+        assert_eq!(
+            osc52_sequence("src/lib.rs"),
+            "\u{1b}]52;c;c3JjL2xpYi5ycw==\u{7}"
+        );
     }
 }

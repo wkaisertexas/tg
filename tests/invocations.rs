@@ -41,7 +41,7 @@ fn every_documented_invocation_resolves_end_to_end() {
         serde_yaml::from_str(include_str!("../examples/invocations.yaml")).unwrap();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for case in document.cases {
-        let output = Command::new(env!("CARGO_BIN_EXE_tscodeselection"))
+        let output = Command::new(env!("CARGO_BIN_EXE_tg"))
             .current_dir(root)
             .args([".", "--resolve", &case.submitted_prompt])
             .output()

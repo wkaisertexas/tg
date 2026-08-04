@@ -1,4 +1,4 @@
-# tscodeselection
+# tg
 
 A Rust terminal composer for fuzzy file references and syntax-aware symbol selection.
 `@` respects Git ignores; `%` searches ignored files too. C, C++, Rust, Python, and Markdown
@@ -15,15 +15,16 @@ code lowers to `path::line:column Name`; Markdown lowers to compact `path.md#hea
 ## Build and verify
 ```sh
 cargo build --release
-cargo test --all-targets --all-features
+just check
 ```
-
-## Run
+## Install and run
 ```sh
-cargo run --release -- <root-folder>
+curl -fsSL https://raw.githubusercontent.com/wkaisertexas/tg/main/install.sh | sh
+tg .
+cargo run --release --bin tg -- <root-folder>
 ```
 
 Type `@`/`%` for files or standalone `::` for repository symbols; append `.` for members.
 `Tab` or Enter. Enter submits when completion is closed; `Ctrl-J` always submits. `Esc`
 dismisses; `Ctrl-C` cancels/clears/exits; `Ctrl-D` exits empty. For automation, add
-`--resolve 'Inspect @src/lib.rs::Symbol'` after the root folder.
+`--resolve 'Inspect @src/lib.rs::Symbol'` after the root folder. Upgrade with `tg update`.

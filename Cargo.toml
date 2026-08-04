@@ -3,15 +3,25 @@ name = "tscodeselection"
 version = "0.1.0"
 edition = "2024"
 description = "A symbol-aware terminal file selector"
+autobins = false
+
+[[bin]]
+name = "tg"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 fuzzy-matcher = "0.3"
 ignore = "0.4"
 ratatui = "0.29"
+rayon = "1"
 regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 tree-sitter = "0.25"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
@@ -20,9 +30,13 @@ tree-sitter-rust = "0.24"
 
 [dev-dependencies]
 assert_cmd = "2"
-serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tempfile = "3"
+criterion = "0.7"
+
+[[bench]]
+name = "repository"
+harness = false
 
 [profile.release]
 strip = true

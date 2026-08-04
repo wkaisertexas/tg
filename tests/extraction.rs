@@ -76,3 +76,21 @@ fn rust_impl_methods_are_available_through_dot_completion() {
     let members = tscodeselection::language::find_symbols(&parsed.symbols, "User.");
     assert_eq!(members[0].qualified_name, "User::save");
 }
+
+#[test]
+fn c_family_lookahead_handles_unicode_near_its_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("unicode.cpp");
+    let source = format!(
+        "struct Forward; // {}り\nstruct Defined {{}};\n",
+        "x".repeat(487)
+    );
+    fs::write(&path, source).unwrap();
+    let parsed = tscodeselection::language::parse(&path).unwrap().unwrap();
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.leaf_name == "Defined")
+    );
+}
