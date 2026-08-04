@@ -7,6 +7,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -15,10 +16,27 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+struct RepositorySymbol {
+    relative: String,
+    path: PathBuf,
+    symbol: Symbol,
+}
 
 enum Candidate {
     File(FileMatch),
     Symbol(Symbol),
+    RepositorySymbol(RepositorySymbol),
+}
+
+enum IndexMessage {
+    Symbols(Vec<RepositorySymbol>),
+    Progress(usize),
+    Done,
 }
 
 struct ResolvedSpan {
@@ -42,6 +60,12 @@ struct App {
     transcript: Vec<String>,
     transcript_scroll: usize,
     resolutions: Vec<ResolvedSpan>,
+    repository_symbols: Vec<RepositorySymbol>,
+    index_receiver: Option<Receiver<IndexMessage>>,
+    index_started: Option<Instant>,
+    index_scanned: usize,
+    index_total: usize,
+    index_done: bool,
 }
 
 impl App {
@@ -71,6 +95,12 @@ impl App {
             transcript: Vec::new(),
             transcript_scroll: 0,
             resolutions: Vec::new(),
+            repository_symbols: Vec::new(),
+            index_receiver: None,
+            index_started: None,
+            index_scanned: 0,
+            index_total: 0,
+            index_done: false,
         }
     }
 
@@ -78,7 +108,9 @@ impl App {
         self.text
             .rsplit(|c: char| c.is_whitespace())
             .next()
-            .filter(|token| token.starts_with('@') || token.starts_with('%'))
+            .filter(|token| {
+                token.starts_with('@') || token.starts_with('%') || token.starts_with("::")
+            })
     }
 
     fn refresh(&mut self) {
@@ -89,6 +121,11 @@ impl App {
             return;
         };
         if self.accepted.as_deref() == Some(&token) {
+            return;
+        }
+        if let Some(query) = token.strip_prefix("::") {
+            self.start_repository_index();
+            self.refresh_repository_symbols(query);
             return;
         }
         let sigil = token.as_bytes()[0] as char;
@@ -147,6 +184,105 @@ impl App {
         }
     }
 
+    fn start_repository_index(&mut self) {
+        if self.index_receiver.is_some() || self.index_done {
+            return;
+        }
+        let files: Vec<_> = self
+            .broad
+            .iter()
+            .filter(|path| language::supports(path))
+            .cloned()
+            .collect();
+        self.index_total = files.len();
+        self.index_started = Some(Instant::now());
+        let root = self.repo.search_root.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.index_receiver = Some(receiver);
+        thread::spawn(move || {
+            for (index, path) in files.into_iter().enumerate() {
+                if let Ok(Some(parsed)) = language::parse(&path) {
+                    let relative = path
+                        .strip_prefix(&root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let symbols = parsed
+                        .symbols
+                        .into_iter()
+                        .map(|symbol| RepositorySymbol {
+                            relative: relative.clone(),
+                            path: path.clone(),
+                            symbol,
+                        })
+                        .collect();
+                    if sender.send(IndexMessage::Symbols(symbols)).is_err() {
+                        return;
+                    }
+                }
+                if sender.send(IndexMessage::Progress(index + 1)).is_err() {
+                    return;
+                }
+            }
+            let _ = sender.send(IndexMessage::Done);
+        });
+    }
+
+    fn drain_repository_index(&mut self) {
+        let mut changed = false;
+        let mut finished = false;
+        if let Some(receiver) = &self.index_receiver {
+            while let Ok(message) = receiver.try_recv() {
+                match message {
+                    IndexMessage::Symbols(symbols) => {
+                        self.repository_symbols.extend(symbols);
+                        changed = true;
+                    }
+                    IndexMessage::Progress(scanned) => self.index_scanned = scanned,
+                    IndexMessage::Done => {
+                        self.index_done = true;
+                        finished = true;
+                    }
+                }
+            }
+        }
+        if finished {
+            self.index_receiver = None;
+        }
+        if (changed || finished)
+            && let Some(query) = self
+                .current_token()
+                .and_then(|token| token.strip_prefix("::"))
+                .map(str::to_owned)
+        {
+            self.refresh_repository_symbols(&query);
+        }
+    }
+
+    fn refresh_repository_symbols(&mut self, query: &str) {
+        self.candidates = rank_repository_symbols(&self.repository_symbols, query)
+            .into_iter()
+            .map(Candidate::RepositorySymbol)
+            .collect();
+        let elapsed = self
+            .index_started
+            .map_or(0.0, |start| start.elapsed().as_secs_f32());
+        self.status = format!(
+            "REPO SYMBOLS · {}/{} files · {} symbols · {:.2}s{}",
+            self.index_scanned,
+            self.index_total,
+            self.repository_symbols.len(),
+            elapsed,
+            if self.index_done {
+                " · complete"
+            } else {
+                " · indexing…"
+            }
+        );
+        self.selected = self.selected.min(self.candidates.len().saturating_sub(1));
+        self.center_preview();
+    }
+
     fn accept(&mut self) {
         let Some(candidate) = self.candidates.get(self.selected) else {
             return;
@@ -173,6 +309,17 @@ impl App {
                     self.repo.search_root.join(file),
                 )
             }
+            Candidate::RepositorySymbol(candidate) => (
+                format!("@{}::{}", candidate.relative, candidate.symbol.leaf_name),
+                format!(
+                    "{}::{}:{} {}",
+                    candidate.relative,
+                    candidate.symbol.start.line,
+                    candidate.symbol.start.column,
+                    candidate.symbol.leaf_name
+                ),
+                candidate.path.clone(),
+            ),
         };
         let start = self.text.len() - old_token.len();
         self.text.replace_range(start.., &replacement);
@@ -190,7 +337,7 @@ impl App {
 
     fn submit(&mut self) {
         if self.current_token().is_some_and(|token| {
-            (token.starts_with('@') || token.starts_with('%'))
+            (token.starts_with('@') || token.starts_with('%') || token.starts_with("::"))
                 && self.accepted.as_deref() != Some(token)
         }) {
             self.status = "Resolve or remove the active reference before submitting".into();
@@ -227,6 +374,9 @@ impl App {
     fn center_preview(&mut self) {
         self.preview_scroll = match self.candidates.get(self.selected) {
             Some(Candidate::Symbol(symbol)) => centered_preview_scroll(symbol.start.line),
+            Some(Candidate::RepositorySymbol(candidate)) => {
+                centered_preview_scroll(candidate.symbol.start.line)
+            }
             _ => 0,
         };
     }
@@ -329,11 +479,64 @@ fn preview_lines(app: &App) -> Vec<Line<'static>> {
                     .collect()
             })
             .unwrap_or_default(),
+        Some(Candidate::RepositorySymbol(candidate)) => std::fs::read_to_string(&candidate.path)
+            .map(|source| highlighted_source_lines(&source, &candidate.symbol))
+            .unwrap_or_else(|_| vec![Line::from("Preview unavailable")]),
         None => vec![
             Line::from("Type @ for Git-aware files or % to include ignored files."),
             Line::from("After choosing a file, type :: to search declarations."),
         ],
     }
+}
+
+fn highlighted_source_lines(source: &str, symbol: &Symbol) -> Vec<Line<'static>> {
+    source
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let number = index + 1;
+            let style = if number == symbol.start.line {
+                Style::default().fg(Color::Black).bg(Color::LightYellow)
+            } else {
+                Style::default()
+            };
+            Line::styled(format!("{number:>5} │ {line}"), style)
+        })
+        .collect()
+}
+
+fn rank_repository_symbols(index: &[RepositorySymbol], query: &str) -> Vec<RepositorySymbol> {
+    let matcher = SkimMatcherV2::default().ignore_case();
+    let query_lower = query.to_ascii_lowercase();
+    let mut matches: Vec<_> = index
+        .iter()
+        .filter_map(|candidate| {
+            let leaf = candidate.symbol.leaf_name.to_ascii_lowercase();
+            let score = if query.is_empty() {
+                0
+            } else if leaf == query_lower {
+                1_000_000
+            } else if leaf.starts_with(&query_lower) {
+                500_000
+            } else {
+                matcher
+                    .fuzzy_match(&candidate.symbol.leaf_name, query)
+                    .or_else(|| matcher.fuzzy_match(&candidate.symbol.qualified_name, query))?
+            };
+            Some((score, candidate))
+        })
+        .collect();
+    matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.relative.cmp(&right.relative))
+            .then_with(|| left.symbol.start.line.cmp(&right.symbol.start.line))
+    });
+    matches
+        .into_iter()
+        .take(100)
+        .map(|(_, candidate)| candidate.clone())
+        .collect()
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &App) {
@@ -409,6 +612,14 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
                     "{}  {}  · {}:{}",
                     symbol.qualified_name, symbol.kind, symbol.start.line, symbol.start.column
                 ),
+                Candidate::RepositorySymbol(candidate) => format!(
+                    "{} :: {}  {} · {}:{}",
+                    candidate.relative,
+                    candidate.symbol.qualified_name,
+                    candidate.symbol.kind,
+                    candidate.symbol.start.line,
+                    candidate.symbol.start.column
+                ),
             };
             let style = if index == app.selected {
                 Style::default()
@@ -462,8 +673,16 @@ pub fn run(repo: Repository) -> Result<()> {
     let result = (|| -> Result<Vec<String>> {
         let mut app = App::new(repo);
         loop {
+            app.drain_repository_index();
             terminal.draw(|frame| draw(frame, &app))?;
-            if let Event::Key(key) = event::read()?
+            let next_event = if app.index_receiver.is_some() {
+                event::poll(Duration::from_millis(50))?
+                    .then(event::read)
+                    .transpose()?
+            } else {
+                Some(event::read()?)
+            };
+            if let Some(Event::Key(key)) = next_event
                 && key.kind == crossterm::event::KeyEventKind::Press
                 && app.key(key)
             {
@@ -510,5 +729,25 @@ mod tests {
     fn preview_starts_five_lines_before_the_symbol() {
         assert_eq!(centered_preview_scroll(109), 103);
         assert_eq!(centered_preview_scroll(3), 0);
+    }
+
+    #[test]
+    fn repository_symbol_search_prefers_exact_leaf_names() {
+        let candidate = |name: &str| RepositorySymbol {
+            relative: "src/lib.rs".into(),
+            path: PathBuf::from("src/lib.rs"),
+            symbol: Symbol {
+                leaf_name: name.into(),
+                qualified_name: name.into(),
+                kind: "function".into(),
+                start: crate::language::SourcePoint { line: 1, column: 1 },
+                start_byte: 0,
+                end_byte: name.len(),
+                is_definition: true,
+            },
+        };
+        let index = [candidate("renderer"), candidate("render")];
+        let matches = rank_repository_symbols(&index, "render");
+        assert_eq!(matches[0].symbol.leaf_name, "render");
     }
 }

@@ -56,6 +56,10 @@ fn grammar(path: &Path) -> Option<(Language, Flavor)> {
     }
 }
 
+pub fn supports(path: &Path) -> bool {
+    grammar(path).is_some()
+}
+
 pub fn parse(path: &Path) -> Result<Option<ParsedFile>> {
     let Some((language, flavor)) = grammar(path) else {
         return Ok(None);

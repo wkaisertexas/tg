@@ -61,7 +61,7 @@ The MVP does not:
   between files.
 - Guarantee that a symbol can be referenced according to the source
   language's name-resolution rules.
-- Index symbol names across the whole repository.
+- Persist a symbol index between application runs.
 - Search deleted files or older revisions from Git history.
 - Extract local variables, function parameters, or anonymous syntax nodes.
 - Promise a latency, memory, or repository-size target.
@@ -171,10 +171,9 @@ lowered output.
 
 ### 7.3 Symbol Completion
 
-Symbol completion is available only after a file path has resolved to one
-specific current filesystem entry. It begins when the user types `::` after a
-resolved file token or explicitly requests symbol completion for the
-highlighted file.
+Symbol completion begins when the user types `::` after a resolved file token.
+A standalone `::` lazily builds a broad, in-memory repository symbol index and
+streams fuzzy matches while showing indexing time and progress.
 
 Examples:
 
@@ -468,10 +467,9 @@ with a query generation so stale results can be discarded.
 
 ## 13. Caching Strategy
 
-The MVP parses symbols only after a path has resolved or a highlighted file
-needs a symbol preview. It does not eagerly create a repository-wide symbol
-index. Consequently, queries of the form `%<file-fragment>::<symbol-fragment>`
-must first resolve the file portion before symbol matching begins.
+The MVP normally parses symbols only after a path resolves. A standalone `::`
+explicitly opts into a lazy repository-wide in-memory index. Queries of the form
+`%<file-fragment>::<symbol-fragment>` still resolve the file portion first.
 
 Parsed file data should be cached in memory using a key containing at least:
 

@@ -23,7 +23,7 @@ cargo test --all-targets --all-features
 cargo run --release -- <root-folder>
 ```
 
-Type `@` or `%`, choose with arrows and complete with `Tab` or Enter, then type `::`
-for symbols. Enter submits when completion is closed; `Ctrl-J` always submits. `Esc`
+Type `@`/`%` for files or standalone `::` for repository symbols. Complete with
+`Tab` or Enter. Enter submits when completion is closed; `Ctrl-J` always submits. `Esc`
 dismisses; `Ctrl-C` cancels/clears/exits; `Ctrl-D` exits empty. For automation, add
 `--resolve 'Inspect @src/lib.rs::Symbol'` after the root folder.
