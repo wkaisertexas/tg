@@ -35,6 +35,60 @@ pub struct ParsedFile {
     pub symbols: Vec<Symbol>,
 }
 
+pub fn display_name(symbol: &Symbol) -> String {
+    if is_markdown_symbol(symbol) {
+        return markdown_slug(&symbol.leaf_name);
+    }
+    symbol
+        .leaf_name
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+pub fn lowered_reference(file: &str, symbol: &Symbol) -> String {
+    if is_markdown_symbol(symbol) {
+        format!("{file}#{}", markdown_slug(&symbol.leaf_name))
+    } else {
+        format!(
+            "{file}::{}:{} {}",
+            symbol.start.line, symbol.start.column, symbol.leaf_name
+        )
+    }
+}
+
+pub fn is_markdown_symbol(symbol: &Symbol) -> bool {
+    symbol.kind.starts_with("heading ")
+}
+
+pub fn markdown_slug(heading: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_separator = false;
+    for character in heading.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() || character == '_' {
+            if pending_separator && !slug.is_empty() && !slug.ends_with('-') {
+                slug.push('-');
+            }
+            slug.push(character);
+            pending_separator = false;
+        } else if character.is_whitespace() || character == '-' {
+            pending_separator = true;
+        }
+    }
+    slug
+}
+
+pub fn names_equivalent(left: &str, right: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    normalize(left) == normalize(right)
+}
+
 #[derive(Clone, Copy)]
 enum Flavor {
     C,
@@ -57,10 +111,16 @@ fn grammar(path: &Path) -> Option<(Language, Flavor)> {
 }
 
 pub fn supports(path: &Path) -> bool {
-    grammar(path).is_some()
+    grammar(path).is_some() || is_markdown(path)
 }
 
 pub fn parse(path: &Path) -> Result<Option<ParsedFile>> {
+    if is_markdown(path) {
+        let bytes = std::fs::read(path)?;
+        let source = String::from_utf8(bytes).context("source is not valid UTF-8")?;
+        let symbols = parse_markdown_headings(&source);
+        return Ok(Some(ParsedFile { source, symbols }));
+    }
     let Some((language, flavor)) = grammar(path) else {
         return Ok(None);
     };
@@ -86,13 +146,125 @@ pub fn parse(path: &Path) -> Result<Option<ParsedFile>> {
     Ok(Some(ParsedFile { source, symbols }))
 }
 
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown")
+        })
+}
+
+fn parse_markdown_headings(source: &str) -> Vec<Symbol> {
+    let lines: Vec<_> = source.split_inclusive('\n').collect();
+    let mut offsets = Vec::with_capacity(lines.len());
+    let mut offset = 0;
+    for line in &lines {
+        offsets.push(offset);
+        offset += line.len();
+    }
+    let mut symbols = Vec::new();
+    let mut hierarchy: Vec<(usize, String)> = Vec::new();
+    let mut fenced = false;
+    for (index, line) in lines.iter().enumerate() {
+        let without_newline = line.trim_end_matches(['\r', '\n']);
+        let trimmed = without_newline.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let indent = without_newline.len() - trimmed.len();
+        if indent <= 3 {
+            let hashes = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+            if (1..=6).contains(&hashes)
+                && trimmed
+                    .as_bytes()
+                    .get(hashes)
+                    .is_none_or(u8::is_ascii_whitespace)
+            {
+                let after_hashes = &trimmed[hashes..];
+                let leading = after_hashes.len() - after_hashes.trim_start().len();
+                let raw_name = after_hashes.trim();
+                let name = raw_name.trim_end_matches('#').trim_end();
+                if !name.is_empty() {
+                    push_markdown_heading(
+                        &mut symbols,
+                        &mut hierarchy,
+                        hashes,
+                        name,
+                        index + 1,
+                        indent + hashes + leading + 1,
+                        offsets[index] + indent + hashes + leading,
+                    );
+                }
+                continue;
+            }
+        }
+        if index > 0 && is_setext_underline(trimmed) {
+            let previous = lines[index - 1].trim_end_matches(['\r', '\n']);
+            let name = previous.trim();
+            if !name.is_empty() {
+                let column = previous.len() - previous.trim_start().len() + 1;
+                let start_byte = offsets[index - 1] + column - 1;
+                push_markdown_heading(
+                    &mut symbols,
+                    &mut hierarchy,
+                    if trimmed.starts_with('=') { 1 } else { 2 },
+                    name,
+                    index,
+                    column,
+                    start_byte,
+                );
+            }
+        }
+    }
+    symbols
+}
+
+fn is_setext_underline(line: &str) -> bool {
+    let line = line.trim();
+    line.len() >= 3
+        && (line.bytes().all(|byte| byte == b'=') || line.bytes().all(|byte| byte == b'-'))
+}
+
+fn push_markdown_heading(
+    symbols: &mut Vec<Symbol>,
+    hierarchy: &mut Vec<(usize, String)>,
+    level: usize,
+    name: &str,
+    line: usize,
+    column: usize,
+    start_byte: usize,
+) {
+    while hierarchy
+        .last()
+        .is_some_and(|(parent_level, _)| *parent_level >= level)
+    {
+        hierarchy.pop();
+    }
+    let mut qualified: Vec<_> = hierarchy.iter().map(|(_, name)| name.clone()).collect();
+    qualified.push(name.to_owned());
+    symbols.push(Symbol {
+        leaf_name: name.to_owned(),
+        qualified_name: qualified.join("::"),
+        kind: format!("heading {level}"),
+        start: SourcePoint { line, column },
+        start_byte,
+        end_byte: start_byte + name.len(),
+        is_definition: true,
+    });
+    hierarchy.push((level, name.to_owned()));
+}
+
 fn classification(
     kind: &str,
     flavor: Flavor,
     inside_type: bool,
 ) -> Option<(&'static str, &'static str)> {
     let result = match kind {
-        "namespace_definition" => ("namespace", "name"),
+        "namespace_definition" | "mod_item" => ("module", "name"),
         "class_definition" => ("class", "name"),
         "class_specifier" => ("class", "name"),
         "struct_specifier" | "struct_item" => ("struct", "name"),
@@ -168,6 +340,7 @@ fn is_scope(kind: &str) -> bool {
             | "enum_specifier"
             | "enum_item"
             | "trait_item"
+            | "mod_item"
     )
 }
 
@@ -200,6 +373,12 @@ fn unwrap_identifier(node: Node<'_>) -> Option<Node<'_>> {
 fn visit(node: Node<'_>, source: &[u8], flavor: Flavor, scopes: &[String], out: &mut Vec<Symbol>) {
     let inside_type = !scopes.is_empty();
     let mut child_scopes = scopes.to_vec();
+    if node.kind() == "impl_item"
+        && let Some(type_node) = node.child_by_field_name("type").and_then(unwrap_identifier)
+        && let Ok(name) = type_node.utf8_text(source)
+    {
+        child_scopes.push(name.to_owned());
+    }
     if let Some((symbol_kind, field)) = classification(node.kind(), flavor, inside_type)
         && let Some(name_node) = identifier(node, field)
         && let Ok(name) = name_node.utf8_text(source)
@@ -232,6 +411,25 @@ fn visit(node: Node<'_>, source: &[u8], flavor: Flavor, scopes: &[String], out: 
 
 pub fn find_symbols<'a>(symbols: &'a [Symbol], query: &str) -> Vec<&'a Symbol> {
     let matcher = SkimMatcherV2::default().ignore_case();
+    if let Some((parent, member)) = query.rsplit_once('.')
+        && symbols.iter().any(|symbol| {
+            names_equivalent(&symbol.leaf_name, parent)
+                || names_equivalent(&symbol.qualified_name, parent)
+        })
+    {
+        let mut found: Vec<_> = symbols
+            .iter()
+            .filter_map(|symbol| {
+                member_score(symbol, parent, member, &matcher).map(|score| (score, symbol))
+            })
+            .collect();
+        found.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left.start.line.cmp(&right.start.line))
+        });
+        return found.into_iter().map(|(_, symbol)| symbol).collect();
+    }
     let query_lower = query.to_ascii_lowercase();
     let mut found: Vec<_> = symbols
         .iter()
@@ -259,11 +457,39 @@ pub fn find_symbols<'a>(symbols: &'a [Symbol], query: &str) -> Vec<&'a Symbol> {
     found.into_iter().map(|(_, symbol)| symbol).collect()
 }
 
+pub fn member_score(
+    symbol: &Symbol,
+    parent: &str,
+    member: &str,
+    matcher: &SkimMatcherV2,
+) -> Option<i64> {
+    let segments: Vec<_> = symbol.qualified_name.split("::").collect();
+    let parent_index = segments
+        .iter()
+        .rposition(|segment| names_equivalent(segment, parent))?;
+    if parent_index + 1 >= segments.len() {
+        return None;
+    }
+    let leaf = symbol.leaf_name.to_ascii_lowercase();
+    let member_lower = member.to_ascii_lowercase();
+    let name_score = if member.is_empty() {
+        10_000
+    } else if leaf == member_lower {
+        1_000_000
+    } else if leaf.starts_with(&member_lower) {
+        500_000
+    } else {
+        matcher.fuzzy_match(&symbol.leaf_name, member)?
+    };
+    let distance = segments.len() - parent_index - 1;
+    Some(name_score + if distance == 1 { 100_000 } else { 0 })
+}
+
 pub fn resolve_unique<'a>(symbols: &'a [Symbol], query: &str) -> Result<&'a Symbol> {
     let exact: Vec<_> = symbols
         .iter()
         .filter(|s| {
-            s.leaf_name.eq_ignore_ascii_case(query) || s.qualified_name.eq_ignore_ascii_case(query)
+            names_equivalent(&s.leaf_name, query) || names_equivalent(&s.qualified_name, query)
         })
         .collect();
     match exact.as_slice() {

@@ -1,8 +1,8 @@
 # tscodeselection
 
-A Rust terminal composer for fuzzy file references and Tree-sitter symbol selection.
-`@` respects Git ignores; `%` searches ignored files too. C, C++, Rust, and Python
-symbols lower to natural `path::line:byte-column SymbolName` references on submission.
+A Rust terminal composer for fuzzy file references and syntax-aware symbol selection.
+`@` respects Git ignores; `%` searches ignored files too. C, C++, Rust, Python, and Markdown
+code lowers to `path::line:column Name`; Markdown lowers to compact `path.md#heading` anchors.
 
 ## Scaffold
 
@@ -23,7 +23,7 @@ cargo test --all-targets --all-features
 cargo run --release -- <root-folder>
 ```
 
-Type `@`/`%` for files or standalone `::` for repository symbols. Complete with
+Type `@`/`%` for files or standalone `::` for repository symbols; append `.` for members.
 `Tab` or Enter. Enter submits when completion is closed; `Ctrl-J` always submits. `Esc`
 dismisses; `Ctrl-C` cancels/clears/exits; `Ctrl-D` exits empty. For automation, add
 `--resolve 'Inspect @src/lib.rs::Symbol'` after the root folder.

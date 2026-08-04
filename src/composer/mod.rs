@@ -40,10 +40,9 @@ pub fn resolve_prompt(search_root: &Path, prompt: &str) -> Result<String> {
                     let parsed = language::parse(&path)?
                         .context("symbol completion is unavailable for this file")?;
                     let selected = language::resolve_unique(&parsed.symbols, query)?;
-                    output.push_str(&format!(
-                        "::{}:{} {}",
-                        selected.start.line, selected.start.column, selected.leaf_name
-                    ));
+                    let lowered = language::lowered_reference(file, selected);
+                    output.truncate(output.len() - file.len());
+                    output.push_str(&lowered);
                 }
                 index = end;
                 continue;

@@ -40,12 +40,12 @@ The MVP must:
 - Fuzzy-search ordinary project files with `@`.
 - Fuzzy-search a broader filesystem view, including Git-ignored files, with
   `%`.
-- Parse a resolved C, C++, Rust, or Python file with Tree-sitter.
+- Parse C, C++, Rust, and Python with Tree-sitter and extract Markdown headings.
 - Complete useful non-local symbols after the file has been resolved.
 - Permit concise leaf-name references to nested symbols without requiring the
   full namespace or enclosing-type path.
-- Convert selected symbols to one-based `path::line:column SymbolName` locations when the
-  user submits the prompt.
+- Convert code symbols to one-based `path::line:column SymbolName` locations and
+  Markdown headings to compact `path.md#heading-anchor` references on submission.
 - Show a scrollable source preview so the user can verify the selected
   location.
 - Print the lowered prompt as ordinary, unescaped text without JSON framing.
@@ -65,7 +65,6 @@ The MVP does not:
 - Search deleted files or older revisions from Git history.
 - Extract local variables, function parameters, or anonymous syntax nodes.
 - Promise a latency, memory, or repository-size target.
-- Persist an index between application runs.
 
 ## 5. Terminology
 
@@ -195,6 +194,11 @@ nested structure:
 The shorter form searches symbol leaf names anywhere in the selected file.
 This behavior is deliberately looser than compiler name resolution.
 
+Typing `.` after a symbol or heading display name ranks its direct children
+before deeper descendants. For example, `@src/app.py::Flask.` lists methods and
+`@guide.md::Setup.` lists subsections. Standalone `::Flask.` performs the same
+member-style filtering against the repository-wide comparison index.
+
 If a query matches more than one symbol, the completion list must show each
 candidate's:
 
@@ -273,13 +277,16 @@ The MVP supports:
 
 - C;
 - C++;
-- Rust; and
-- Python.
+- Rust;
+- Python; and
+- Markdown headings.
 
 Language selection is based primarily on file extension, with conventional
 extensions for these languages. Header files that are ambiguous between C and
 C++ should default to C++ parsing for the MVP, because C++ grammar generally
 provides the more useful declaration surface for the intended use case.
+Markdown ATX and setext headings form hierarchical section symbols; fenced code
+blocks are excluded.
 
 Unsupported extensions remain available as whole-file references.
 
@@ -380,6 +387,7 @@ replaced independently:
 | `%fixtures/output.py` | `fixtures/output.py` |
 | `@src/model.rs::User` | `src/model.rs::12:8 User` |
 | `%gen/case.cpp::Fixture` | `gen/case.cpp::41:3 Fixture` |
+| `@docs/guide.md::Quick-Start` | `docs/guide.md#quick-start` |
 
 All paths are relative to the search root and use `/` separators. Lines and
 columns are one-based decimal integers. A symbol reference emits the selected

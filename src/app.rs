@@ -301,23 +301,18 @@ impl App {
                     .unwrap_or(&old_token);
                 let file = prefix[1..].to_owned();
                 (
-                    format!("{prefix}::{}", symbol.leaf_name),
-                    format!(
-                        "{file}::{}:{} {}",
-                        symbol.start.line, symbol.start.column, symbol.leaf_name
-                    ),
+                    format!("{prefix}::{}", language::display_name(symbol)),
+                    language::lowered_reference(&file, symbol),
                     self.repo.search_root.join(file),
                 )
             }
             Candidate::RepositorySymbol(candidate) => (
-                format!("@{}::{}", candidate.relative, candidate.symbol.leaf_name),
                 format!(
-                    "{}::{}:{} {}",
+                    "@{}::{}",
                     candidate.relative,
-                    candidate.symbol.start.line,
-                    candidate.symbol.start.column,
-                    candidate.symbol.leaf_name
+                    language::display_name(&candidate.symbol)
                 ),
+                language::lowered_reference(&candidate.relative, &candidate.symbol),
                 candidate.path.clone(),
             ),
         };
@@ -483,8 +478,8 @@ fn preview_lines(app: &App) -> Vec<Line<'static>> {
             .map(|source| highlighted_source_lines(&source, &candidate.symbol))
             .unwrap_or_else(|_| vec![Line::from("Preview unavailable")]),
         None => vec![
-            Line::from("Type @ for Git-aware files or % to include ignored files."),
-            Line::from("After choosing a file, type :: to search declarations."),
+            Line::from("Type @ for files, % for ignored files, or :: for all symbols."),
+            Line::from("After a symbol or Markdown heading, type . for children."),
         ],
     }
 }
@@ -507,12 +502,20 @@ fn highlighted_source_lines(source: &str, symbol: &Symbol) -> Vec<Line<'static>>
 
 fn rank_repository_symbols(index: &[RepositorySymbol], query: &str) -> Vec<RepositorySymbol> {
     let matcher = SkimMatcherV2::default().ignore_case();
+    let member_query = query.rsplit_once('.').filter(|(parent, _)| {
+        index.iter().any(|candidate| {
+            language::names_equivalent(&candidate.symbol.leaf_name, parent)
+                || language::names_equivalent(&candidate.symbol.qualified_name, parent)
+        })
+    });
     let query_lower = query.to_ascii_lowercase();
     let mut matches: Vec<_> = index
         .iter()
         .filter_map(|candidate| {
             let leaf = candidate.symbol.leaf_name.to_ascii_lowercase();
-            let score = if query.is_empty() {
+            let score = if let Some((parent, member)) = member_query {
+                language::member_score(&candidate.symbol, parent, member, &matcher)?
+            } else if query.is_empty() {
                 0
             } else if leaf == query_lower {
                 1_000_000
@@ -608,10 +611,25 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
                     },
                     file.relative
                 ),
+                Candidate::Symbol(symbol) if language::is_markdown_symbol(symbol) => format!(
+                    "#{} · {}",
+                    language::display_name(symbol),
+                    symbol.start.line
+                ),
                 Candidate::Symbol(symbol) => format!(
-                    "{}  {}  · {}:{}",
+                    "{}  {} · {}:{}",
                     symbol.qualified_name, symbol.kind, symbol.start.line, symbol.start.column
                 ),
+                Candidate::RepositorySymbol(candidate)
+                    if language::is_markdown_symbol(&candidate.symbol) =>
+                {
+                    format!(
+                        "{}#{} · {}",
+                        candidate.relative,
+                        language::display_name(&candidate.symbol),
+                        candidate.symbol.start.line
+                    )
+                }
                 Candidate::RepositorySymbol(candidate) => format!(
                     "{} :: {}  {} · {}:{}",
                     candidate.relative,
