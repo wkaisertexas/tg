@@ -1,6 +1,6 @@
 use super::model::{
-    AcceptedReference, CompletionActivation, GenerationId, LoweredReference, QueryRequest,
-    ReferenceCandidate, ReferenceId, ReferenceKind, ResolvedReference, SessionUpdate,
+    AcceptedReference, CompletionActivation, GenerationId, LoweredReference, QueryEmission,
+    QueryRequest, ReferenceCandidate, ReferenceId, ReferenceKind, ResolvedReference, SessionUpdate,
     SharedProvider, TextRange,
 };
 use super::{BackgroundExecutor, CancellationFlag, ReferenceProvider};
@@ -13,6 +13,7 @@ enum QueryMessage {
     Results {
         generation: GenerationId,
         candidates: Vec<ReferenceCandidate>,
+        completed: bool,
     },
     Failed {
         generation: GenerationId,
@@ -71,12 +72,13 @@ impl ReferenceSession {
         activation: CompletionActivation,
         limit: usize,
     ) -> Result<GenerationId> {
-        self.start_query(
+        self.start_query_with_leader(
             activation.kind,
             activation.query,
             activation.scope,
             activation.replacement_range,
             limit,
+            activation.typed_leader,
         )
     }
 
@@ -88,6 +90,23 @@ impl ReferenceSession {
         replacement_range: TextRange,
         limit: usize,
     ) -> Result<GenerationId> {
+        self.start_query_with_leader(kind, query, scope, replacement_range, limit, String::new())
+    }
+
+    fn start_query_with_leader(
+        &mut self,
+        kind: ReferenceKind,
+        query: String,
+        scope: super::model::QueryScope,
+        replacement_range: TextRange,
+        limit: usize,
+        typed_leader: String,
+    ) -> Result<GenerationId> {
+        let provider = Arc::clone(
+            self.providers
+                .get(&kind)
+                .with_context(|| format!("no provider registered for {kind:?}"))?,
+        );
         self.cancel_current();
         self.advance_generation();
         self.candidates.clear();
@@ -95,33 +114,33 @@ impl ReferenceSession {
         self.active_kind = Some(kind);
         self.active_range = Some(replacement_range);
 
-        let provider = Arc::clone(
-            self.providers
-                .get(&kind)
-                .with_context(|| format!("no provider registered for {kind:?}"))?,
-        );
         let request = QueryRequest {
             generation: self.generation,
             query,
             scope,
             limit,
+            typed_leader,
         };
         let generation = self.generation;
         let cancellation = CancellationFlag::default();
         self.cancellation = Some(cancellation.clone());
         let sender = self.sender.clone();
         self.executor.spawn(Box::new(move || {
-            let message = match provider.query(request, &cancellation) {
-                Ok(candidates) => QueryMessage::Results {
-                    generation,
-                    candidates,
-                },
-                Err(error) => QueryMessage::Failed {
+            let mut emit = |emission: QueryEmission| {
+                sender
+                    .send(QueryMessage::Results {
+                        generation: emission.generation,
+                        candidates: emission.candidates,
+                        completed: emission.completed,
+                    })
+                    .map_err(|_| anyhow::anyhow!("reference query receiver closed"))
+            };
+            if let Err(error) = provider.query_progressive(request, &cancellation, &mut emit) {
+                let _ = sender.send(QueryMessage::Failed {
                     generation,
                     message: error.to_string(),
-                },
-            };
-            let _ = sender.send(message);
+                });
+            }
         }));
         Ok(generation)
     }
@@ -142,11 +161,22 @@ impl ReferenceSession {
                 QueryMessage::Results {
                     generation,
                     candidates,
+                    completed,
                 } if generation == self.generation && self.active_kind.is_some() => {
-                    self.candidates = candidates;
-                    self.selected = self.selected.min(self.candidates.len().saturating_sub(1));
-                    update.candidates_changed = true;
-                    update.completed = true;
+                    let active_kind = self.active_kind.expect("guarded above");
+                    if candidates.iter().all(|candidate| {
+                        candidate.generation == generation
+                            && candidate.kind == active_kind
+                            && candidate.id.provider == active_kind
+                    }) {
+                        self.candidates = candidates;
+                        self.selected = self.selected.min(self.candidates.len().saturating_sub(1));
+                        update.candidates_changed = true;
+                        update.completed |= completed;
+                    } else {
+                        update.error = Some("provider returned inconsistent candidates".into());
+                        update.completed = true;
+                    }
                 }
                 QueryMessage::Failed {
                     generation,
@@ -181,14 +211,28 @@ impl ReferenceSession {
 
     pub fn accept_selected(&mut self) -> Result<AcceptedReference> {
         let candidate = self.selected().context("no reference candidate selected")?;
+        anyhow::ensure!(
+            candidate.generation == self.generation,
+            "candidate belongs to a stale query"
+        );
+        anyhow::ensure!(
+            Some(candidate.kind) == self.active_kind,
+            "candidate kind does not match the active provider"
+        );
+        anyhow::ensure!(
+            candidate.id.provider == candidate.kind,
+            "candidate identifier belongs to another provider"
+        );
         let provider = self.provider(candidate.id.provider)?;
         let target = provider.resolve(&candidate.id)?;
         let range = self.active_range.context("no active completion range")?;
         let friendly_text = candidate.friendly_text.clone();
+        let resolved_range =
+            TextRange::new(range.start, range.start + friendly_text.chars().count())?;
         self.next_reference_id += 1;
         let reference = ResolvedReference {
             id: ReferenceId(self.next_reference_id),
-            range,
+            range: resolved_range,
             friendly_text: friendly_text.clone(),
             target,
         };
@@ -291,6 +335,8 @@ mod tests {
                     ..CandidateDisplay::default()
                 },
                 context_cost: ContextCost::Pending,
+                file_context_cost: None,
+                source_version: None,
             }
         }
     }

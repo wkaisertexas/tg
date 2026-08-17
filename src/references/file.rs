@@ -7,6 +7,8 @@ use super::{CancellationFlag, ReferenceProvider};
 use crate::search::{self, SearchMode};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -52,8 +54,12 @@ impl FileProvider {
         );
         Ok(FileTarget {
             source_version: Some(file_version(&canonical_path)?),
+            relative_path: canonical_path
+                .strip_prefix(&self.canonical_root)
+                .context("file is outside search root")?
+                .to_string_lossy()
+                .replace('\\', "/"),
             canonical_path,
-            relative_path: relative.replace('\\', "/"),
             origin: self.origin,
         })
     }
@@ -94,6 +100,8 @@ impl ReferenceProvider for FileProvider {
                         ..CandidateDisplay::default()
                     },
                     context_cost: ContextCost::Pending,
+                    file_context_cost: None,
+                    source_version: None,
                 })
                 .collect(),
         )
@@ -155,14 +163,21 @@ impl ReferenceProvider for FileProvider {
 }
 
 pub fn file_version(path: &Path) -> Result<FileVersion> {
-    let bytes = std::fs::read(path)?;
-    let metadata = std::fs::metadata(path)?;
-    let digest: [u8; 32] = Sha256::digest(&bytes).into();
-    Ok(FileVersion {
-        size: metadata.len(),
-        modified: metadata.modified().ok(),
-        content_sha256: digest,
-    })
+    for _ in 0..2 {
+        let mut file = File::open(path)?;
+        let before = file.metadata()?;
+        let mut bytes = Vec::with_capacity(before.len() as usize);
+        file.read_to_end(&mut bytes)?;
+        let after = file.metadata()?;
+        if before.len() == after.len() && before.modified().ok() == after.modified().ok() {
+            return Ok(FileVersion {
+                size: after.len(),
+                modified: after.modified().ok(),
+                content_sha256: Sha256::digest(&bytes).into(),
+            });
+        }
+    }
+    bail!("file changed while it was being read")
 }
 
 #[cfg(test)]
@@ -219,6 +234,7 @@ mod tests {
                     query: "generated".into(),
                     scope: QueryScope::Repository,
                     limit: 100,
+                    typed_leader: "%".into(),
                 },
                 &CancellationFlag::default(),
             )

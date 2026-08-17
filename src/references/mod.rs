@@ -1,11 +1,12 @@
 pub mod file;
 pub mod model;
 pub mod session;
+pub mod symbol;
 
 use anyhow::Result;
 use model::{
-    CandidateId, ContextCost, Preview, QueryRequest, ReferenceCandidate, ReferenceKind,
-    ReferenceTarget, ValidatedTarget,
+    CandidateId, ContextCost, Preview, QueryEmission, QueryRequest, ReferenceCandidate,
+    ReferenceKind, ReferenceTarget, ValidatedTarget,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +33,19 @@ pub struct ThreadExecutor;
 
 impl BackgroundExecutor for ThreadExecutor {
     fn spawn(&self, job: Box<dyn FnOnce() + Send>) {
-        std::thread::spawn(job);
+        static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(
+                    std::thread::available_parallelism()
+                        .map_or(4, usize::from)
+                        .min(8),
+                )
+                .thread_name(|index| format!("tg-provider-{index}"))
+                .build()
+                .expect("could not create provider workers")
+        })
+        .spawn(job);
     }
 }
 
@@ -45,6 +58,21 @@ pub trait ReferenceProvider: Send + Sync {
         request: QueryRequest,
         cancellation: &CancellationFlag,
     ) -> Result<Vec<ReferenceCandidate>>;
+
+    fn query_progressive(
+        &self,
+        request: QueryRequest,
+        cancellation: &CancellationFlag,
+        emit: &mut dyn FnMut(QueryEmission) -> Result<()>,
+    ) -> Result<()> {
+        let generation = request.generation;
+        let candidates = self.query(request, cancellation)?;
+        emit(QueryEmission {
+            generation,
+            candidates,
+            completed: true,
+        })
+    }
 
     fn resolve(&self, id: &CandidateId) -> Result<ReferenceTarget>;
     fn validate(&self, target: &ReferenceTarget) -> Result<ValidatedTarget>;

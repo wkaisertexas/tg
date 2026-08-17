@@ -46,6 +46,7 @@ pub struct QueryRequest {
     pub query: String,
     pub scope: QueryScope,
     pub limit: usize,
+    pub typed_leader: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,7 @@ pub enum QueryScope {
     File {
         canonical_path: PathBuf,
         relative_path: String,
+        origin: FileOrigin,
     },
 }
 
@@ -65,6 +67,8 @@ pub struct ReferenceCandidate {
     pub friendly_text: String,
     pub display: CandidateDisplay,
     pub context_cost: ContextCost,
+    pub file_context_cost: Option<ContextCost>,
+    pub source_version: Option<FileVersion>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -117,6 +121,7 @@ pub struct SymbolIdentity {
     pub qualified_name: String,
     pub leaf_name: String,
     pub kind: String,
+    pub is_definition: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +130,8 @@ pub struct SymbolTarget {
     pub identity: SymbolIdentity,
     pub start_byte: usize,
     pub end_byte: usize,
+    pub name_start_byte: usize,
+    pub name_end_byte: usize,
     pub location: SourceLocation,
     pub markdown_anchor: Option<String>,
 }
@@ -204,6 +211,13 @@ pub struct SessionUpdate {
     pub candidates_changed: bool,
     pub completed: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryEmission {
+    pub generation: GenerationId,
+    pub candidates: Vec<ReferenceCandidate>,
+    pub completed: bool,
 }
 
 pub(crate) type SharedProvider = Arc<dyn super::ReferenceProvider>;
