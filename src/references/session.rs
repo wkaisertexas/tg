@@ -493,6 +493,10 @@ impl ReferenceSession {
         self.active_kind.is_some()
     }
 
+    pub fn active_kind(&self) -> Option<ReferenceKind> {
+        self.active_kind
+    }
+
     pub fn selected(&self) -> Option<&ReferenceCandidate> {
         self.candidates.get(self.selected)
     }

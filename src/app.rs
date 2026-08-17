@@ -2,16 +2,19 @@ use crate::config::{ColorMode, Config, LeadersConfig, PreviewMode};
 use crate::editor::command::{CommandDispatcher, CommandEffect, LowerRequest};
 use crate::editor::save::{AtomicSaver, SaveTarget};
 use crate::editor::{AdapterMode, Document, EditorInput, EditorSession, TextEdit};
-use crate::references::ThreadExecutor;
 use crate::references::activation::detect_activation;
 use crate::references::file::FileProvider;
+use crate::references::github::GithubProvider;
+use crate::references::jira::JiraProvider;
 use crate::references::model::{
     CandidateId, ContextCost, Preview, ReferenceCandidate, ReferenceKind, TextRange,
 };
 use crate::references::session::{
     DocumentRevision, LowerPurpose, OperationKind, ReferenceEvent, ReferenceSession,
 };
+use crate::references::skill::SkillProvider;
 use crate::references::symbol::SymbolProvider;
+use crate::references::{ReferenceProvider, ThreadExecutor};
 use crate::repository::Repository;
 use crate::tokens::{ContextTotal, format_tokens};
 use anyhow::{Context, Result};
@@ -73,12 +76,40 @@ impl App {
             config.leaders.broad_files.clone(),
         )?;
         let symbols = SymbolProvider::new(&repo.search_root, config.leaders.files.clone())?;
+        let skills = SkillProvider::new(
+            &repo.search_root,
+            &repo.invocation_root,
+            &config.skills,
+            config.leaders.skills.clone(),
+        )?;
+        let mut providers = vec![
+            Arc::new(git) as Arc<dyn ReferenceProvider>,
+            Arc::new(broad),
+            Arc::new(symbols),
+            Arc::new(skills),
+        ];
+        // External executables are intentionally not probed here. A missing or
+        // unauthenticated CLI therefore affects only a query for its leader.
+        if config.providers.github.enabled {
+            providers.push(Arc::new(GithubProvider::issues(
+                &repo.invocation_root,
+                config.leaders.github_issues.clone(),
+                &config.providers.github,
+            )));
+            providers.push(Arc::new(GithubProvider::pull_requests(
+                &repo.invocation_root,
+                config.leaders.github_pull_requests.clone(),
+                &config.providers.github,
+            )));
+        }
+        if config.providers.jira.enabled {
+            providers.push(Arc::new(JiraProvider::new(
+                &config.providers.jira,
+                config.leaders.jira_issues.clone(),
+            )?));
+        }
         let mut reference_session = ReferenceSession::with_tokenizer(
-            [
-                Arc::new(git) as Arc<dyn crate::references::ReferenceProvider>,
-                Arc::new(broad),
-                Arc::new(symbols),
-            ],
+            providers,
             Arc::new(ThreadExecutor),
             &config.tokens.tokenizer,
         )?;
@@ -479,6 +510,19 @@ fn candidate_text(candidate: &ReferenceCandidate) -> String {
     text
 }
 
+fn completion_title(kind: Option<ReferenceKind>) -> &'static str {
+    match kind {
+        Some(ReferenceKind::GitFile) => " Files ",
+        Some(ReferenceKind::BroadFile) => " All Files ",
+        Some(ReferenceKind::Symbol) => " Symbols ",
+        Some(ReferenceKind::Skill) => " Skills ",
+        Some(ReferenceKind::GitHubIssue) => " GitHub Issues ",
+        Some(ReferenceKind::GitHubPullRequest) => " GitHub Pull Requests ",
+        Some(ReferenceKind::JiraIssue) => " Jira Issues ",
+        None => " Completion ",
+    }
+}
+
 fn format_context_cost(cost: &ContextCost) -> Option<String> {
     match cost {
         ContextCost::Pending => Some("…".into()),
@@ -597,7 +641,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             })
             .collect::<Vec<_>>();
         frame.render_widget(
-            List::new(items).block(Block::default().borders(Borders::ALL).title(" Completion ")),
+            List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(completion_title(app.reference_session.active_kind())),
+            ),
             columns[0],
         );
         if show_preview {
@@ -675,6 +723,66 @@ fn format_context_total(total: ContextTotal) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::references::model::{QueryScope, TextRange};
+    use std::fs;
+    use std::path::Path;
+    use std::thread;
+    use std::time::Instant;
+
+    fn app_for(root: &Path, config: &Config, text: &str) -> App {
+        App::new(
+            Repository::discover(root).unwrap(),
+            config,
+            Document::from_text(text),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn activate_text(app: &mut App, text: &str) {
+        let activation = detect_activation(
+            text,
+            text.chars().count(),
+            &app.leaders,
+            &app.repo.search_root,
+        )
+        .unwrap()
+        .expect("test text must activate a leader");
+        app.reference_session
+            .activate(activation, app.search_limit)
+            .unwrap();
+    }
+
+    fn wait_for(app: &mut App, ready: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            app.drain_reference_events();
+            if ready(app) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for app state; status={}", app.status);
+    }
+
+    fn accept_and_lower(app: &mut App) -> String {
+        wait_for(app, |app| !app.reference_session.candidates().is_empty());
+        app.accept_selected();
+        wait_for(app, |app| !app.document.references().is_empty());
+        app.dispatch_command(":copy".into());
+        wait_for(app, |app| app.pending_clipboard.is_some());
+        app.pending_clipboard.take().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn executable(path: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, script).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
 
     #[test]
     fn diff_is_unicode_character_based_and_minimal() {
@@ -706,6 +814,15 @@ mod tests {
     }
 
     #[test]
+    fn completion_headers_name_the_active_provider() {
+        assert_eq!(
+            completion_title(Some(ReferenceKind::GitHubPullRequest)),
+            " GitHub Pull Requests "
+        );
+        assert_eq!(completion_title(Some(ReferenceKind::Skill)), " Skills ");
+    }
+
+    #[test]
     fn idle_layout_reserves_only_editor_and_status_rows() {
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -714,5 +831,136 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].height, 7);
         assert_eq!(rows[1].height, 1);
+    }
+
+    #[test]
+    fn disabled_external_providers_are_absent_but_skills_remain_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill = temp.path().join(".agents/skills/local");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: local\ndescription: Local fixture\n---\nbody\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.providers.github.enabled = false;
+        config.providers.jira.enabled = false;
+        config.leaders.skills = "~s".into();
+        config.leaders.github_issues = "~i".into();
+        config.leaders.github_pull_requests = "~p".into();
+        config.leaders.jira_issues = "~j".into();
+        let mut app = app_for(temp.path(), &config, "~slocal");
+
+        let github = detect_activation("~i1", 3, &app.leaders, &app.repo.search_root)
+            .unwrap()
+            .unwrap();
+        assert!(
+            app.reference_session
+                .activate(github, app.search_limit)
+                .unwrap_err()
+                .to_string()
+                .contains("no provider registered")
+        );
+
+        activate_text(&mut app, "~slocal");
+        assert_eq!(accept_and_lower(&mut app), "~slocal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_external_leaders_query_accept_and_lower_urls_end_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let gh = temp.path().join("fake-gh");
+        executable(
+            &gh,
+            r##"#!/bin/sh
+case "$1" in
+  issue) printf '%s' '[{"number":17,"title":"Fixture issue","url":"https://github.example/org/repo/issues/17","state":"OPEN","labels":[],"updatedAt":"2026-08-17T00:00:00Z"}]' ;;
+  pr) printf '%s' '[{"number":23,"title":"Fixture PR","url":"https://github.example/org/repo/pull/23","state":"OPEN","isDraft":false,"updatedAt":"2026-08-17T00:00:00Z"}]' ;;
+esac
+"##,
+        );
+        let jira = temp.path().join("fake-jira");
+        executable(
+            &jira,
+            r##"#!/bin/sh
+printf '%s' '{"key":"OPS-42","self":"https://jira.example/rest/api/3/issue/OPS-42","fields":{"summary":"Fixture Jira","status":{"name":"Open"}}}'
+"##,
+        );
+        let mut config = Config::default();
+        config.leaders.github_issues = "~i".into();
+        config.leaders.github_pull_requests = "~p".into();
+        config.leaders.jira_issues = "~j".into();
+        config.providers.github.command = gh;
+        config.providers.jira.command = jira;
+        config.providers.jira.key_prefix = Some("OPS".into());
+
+        for (text, expected) in [
+            ("~i17", "https://github.example/org/repo/issues/17"),
+            ("~p23", "https://github.example/org/repo/pull/23"),
+            ("~j42", "https://jira.example/browse/OPS-42"),
+        ] {
+            let mut app = app_for(temp.path(), &config, text);
+            activate_text(&mut app, text);
+            assert_eq!(accept_and_lower(&mut app), expected);
+        }
+    }
+
+    #[test]
+    fn missing_external_cli_error_does_not_poison_local_provider_queries() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("local.txt"), "fixture").unwrap();
+        let skill = temp.path().join(".agents/skills/resilient");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: resilient\ndescription: Still available\n---\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.providers.github.command = temp.path().join("missing-gh");
+        config.leaders.github_issues = "~i".into();
+        config.leaders.skills = "~s".into();
+        let mut app = app_for(temp.path(), &config, "~i1");
+
+        activate_text(&mut app, "~i1");
+        wait_for(&mut app, |app| app.status.contains("was not found"));
+
+        app.reference_session
+            .start_query(
+                ReferenceKind::GitFile,
+                "local".into(),
+                QueryScope::Repository,
+                TextRange::new(0, 0).unwrap(),
+                10,
+            )
+            .unwrap();
+        wait_for(&mut app, |app| {
+            app.reference_session
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.friendly_text.ends_with("local.txt"))
+        });
+
+        activate_text(&mut app, "~sresilient");
+        wait_for(&mut app, |app| {
+            app.reference_session
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.friendly_text == "~sresilient")
+        });
+
+        // Symbol registration remains present as well; an unknown file may
+        // yield no symbols, but it must not fail as an unregistered provider.
+        app.reference_session
+            .start_query(
+                ReferenceKind::Symbol,
+                "missing.rs::item".into(),
+                QueryScope::Repository,
+                TextRange::new(0, 0).unwrap(),
+                10,
+            )
+            .unwrap();
     }
 }
