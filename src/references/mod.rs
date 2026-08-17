@@ -1,6 +1,8 @@
 pub mod activation;
 pub mod file;
+pub mod github;
 pub mod model;
+mod process;
 pub mod session;
 pub mod symbol;
 
