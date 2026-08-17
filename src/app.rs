@@ -1,4 +1,4 @@
-use crate::config::{ColorMode, Config, LeadersConfig, PreviewMode};
+use crate::config::{ColorMode, Config, LeadersConfig, PreviewMode, TokenConfig};
 use crate::editor::command::{CommandDispatcher, CommandEffect, LowerRequest};
 use crate::editor::save::{AtomicSaver, SaveTarget};
 use crate::editor::{AdapterMode, Document, EditorInput, EditorSession, TextEdit};
@@ -16,7 +16,7 @@ use crate::references::skill::SkillProvider;
 use crate::references::symbol::SymbolProvider;
 use crate::references::{ReferenceProvider, ThreadExecutor};
 use crate::repository::Repository;
-use crate::tokens::{ContextTotal, format_tokens};
+use crate::tokens::ContextTotal;
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -27,7 +27,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct CachedPreview {
     candidate_id: CandidateId,
@@ -44,12 +44,18 @@ struct App {
     reference_session: ReferenceSession,
     leaders: LeadersConfig,
     search_limit: usize,
+    search_debounce: Duration,
     preview_mode: PreviewMode,
     preview_visible: bool,
     color: bool,
     completion_height: u16,
     completion_width_percent: u8,
     status: String,
+    observed_status: String,
+    status_changed_at: Instant,
+    status_timeout: Duration,
+    preview_due: Option<Instant>,
+    token_config: TokenConfig,
     preview: Option<CachedPreview>,
     preview_scroll: usize,
     pending_clipboard: Option<String>,
@@ -115,6 +121,7 @@ impl App {
         )?;
         reference_session.update_references(DocumentRevision(0), Arc::from([]))?;
         let mut editor = EditorSession::new(document.text());
+        editor.configure(&config.editor, &config.ui.preview_toggle)?;
         let color = config.ui.color != ColorMode::Never;
         editor.set_reference_style(if color {
             Style::default().fg(Color::Cyan)
@@ -131,12 +138,18 @@ impl App {
             reference_session,
             leaders: config.leaders.clone(),
             search_limit: config.search.limit,
+            search_debounce: Duration::from_millis(config.search.debounce_ms),
             preview_mode: config.ui.preview,
             preview_visible: config.ui.preview == PreviewMode::Automatic,
             color,
             completion_height: config.ui.completion_height,
             completion_width_percent: config.ui.completion_width_percent,
             status: String::new(),
+            observed_status: String::new(),
+            status_changed_at: Instant::now(),
+            status_timeout: Duration::from_millis(config.ui.status_timeout_ms),
+            preview_due: None,
+            token_config: config.tokens.clone(),
             preview: None,
             preview_scroll: 0,
             pending_clipboard: None,
@@ -220,6 +233,32 @@ impl App {
             && let Err(error) = self.reference_session.begin_preview_selected()
         {
             self.status = format!("Preview unavailable: {error}");
+        }
+    }
+
+    fn schedule_preview(&mut self) {
+        if self.preview_mode == PreviewMode::Automatic {
+            self.preview = None;
+            self.preview_due = Some(Instant::now() + self.search_debounce);
+        } else {
+            self.request_preview();
+        }
+    }
+
+    fn tick(&mut self, now: Instant) {
+        if self.status != self.observed_status {
+            self.observed_status.clone_from(&self.status);
+            self.status_changed_at = now;
+        } else if !self.status.is_empty()
+            && !status_is_sticky(&self.status)
+            && now.duration_since(self.status_changed_at) >= self.status_timeout
+        {
+            self.status.clear();
+            self.observed_status.clear();
+        }
+        if self.preview_due.is_some_and(|due| now >= due) {
+            self.preview_due = None;
+            self.request_preview();
         }
     }
 
@@ -309,7 +348,7 @@ impl App {
                             format!("{} matches", self.reference_session.candidates().len());
                         if self.preview_mode == PreviewMode::Automatic {
                             self.preview_visible = true;
-                            self.request_preview();
+                            self.schedule_preview();
                         }
                     } else if let Some(progress) = update.progress {
                         self.status = format!("{} / {} files", progress.scanned, progress.total);
@@ -392,22 +431,22 @@ impl App {
                 }
                 KeyCode::Up => {
                     self.reference_session.select_previous();
-                    self.request_preview();
+                    self.schedule_preview();
                     return;
                 }
                 KeyCode::Down => {
                     self.reference_session.select_next();
-                    self.request_preview();
+                    self.schedule_preview();
                     return;
                 }
                 KeyCode::Char('j') if key.modifiers == KeyModifiers::CONTROL => {
                     self.reference_session.select_next();
-                    self.request_preview();
+                    self.schedule_preview();
                     return;
                 }
                 KeyCode::Char('k') if key.modifiers == KeyModifiers::CONTROL => {
                     self.reference_session.select_previous();
-                    self.request_preview();
+                    self.schedule_preview();
                     return;
                 }
                 _ => {}
@@ -426,7 +465,9 @@ impl App {
                 let _ = self.refresh_activation();
             }
             EditorInput::TogglePreview => {
-                if self.preview_mode != PreviewMode::Disabled {
+                if self.preview_mode == PreviewMode::Disabled {
+                    self.status = "Preview disabled".into();
+                } else {
                     self.preview_visible = !self.preview_visible;
                     if self.preview_visible {
                         self.request_preview();
@@ -497,13 +538,31 @@ fn single_edit(before: &str, after: &str) -> TextEdit {
     )
 }
 
-fn candidate_text(candidate: &ReferenceCandidate) -> String {
+fn candidate_text(candidate: &ReferenceCandidate, tokens: &TokenConfig) -> String {
     let mut text = candidate.display.primary.clone();
     if let Some(secondary) = &candidate.display.secondary {
         text.push_str("  ");
         text.push_str(secondary);
     }
-    if let Some(cost) = format_context_cost(&candidate.context_cost) {
+    if candidate.kind == ReferenceKind::Symbol {
+        if tokens.show_symbol
+            && let Some(cost) = format_context_cost(&candidate.context_cost, tokens.decimals)
+        {
+            text.push_str(" · symbol ");
+            text.push_str(&cost);
+        }
+        if tokens.show_file
+            && let Some(cost) = candidate
+                .file_context_cost
+                .as_ref()
+                .and_then(|cost| format_context_cost(cost, tokens.decimals))
+        {
+            text.push_str(" · file ");
+            text.push_str(&cost);
+        }
+    } else if tokens.show_file
+        && let Some(cost) = format_context_cost(&candidate.context_cost, tokens.decimals)
+    {
         text.push_str(" · ");
         text.push_str(&cost);
     }
@@ -523,16 +582,67 @@ fn completion_title(kind: Option<ReferenceKind>) -> &'static str {
     }
 }
 
-fn format_context_cost(cost: &ContextCost) -> Option<String> {
+fn format_context_cost(cost: &ContextCost, decimals: u8) -> Option<String> {
     match cost {
         ContextCost::Pending => Some("…".into()),
-        ContextCost::Tokens(tokens) if *tokens >= 1_000 => {
-            Some(format!("{:.1}k", *tokens as f64 / 1_000.0))
-        }
+        ContextCost::Tokens(tokens) if *tokens >= 1_000 => Some(format!(
+            "{:.*}k",
+            usize::from(decimals),
+            *tokens as f64 / 1_000.0
+        )),
         ContextCost::Tokens(tokens) => Some(tokens.to_string()),
         ContextCost::Bytes(bytes) => Some(format!("{bytes} bytes")),
         ContextCost::None => None,
         ContextCost::Unavailable => Some("unavailable".into()),
+    }
+}
+
+fn status_is_sticky(status: &str) -> bool {
+    status.starts_with("Cannot ")
+        || status.starts_with("Write failed:")
+        || status.starts_with("Save failed:")
+}
+
+fn status_text(app: &App, width: u16) -> String {
+    let mode = format!("{:?}", app.editor.mode()).to_uppercase();
+    let path = app
+        .save_target
+        .as_ref()
+        .map_or("[No Name]".into(), |target| {
+            target.logical_path().display().to_string()
+        });
+    let dirty = if app.document.is_dirty() { " [+]" } else { "" };
+    let cursor = app.editor.state().cursor;
+    let location = format!("{}:{}", cursor.row + 1, cursor.col + 1);
+    let refs = app.token_config.show_total.then(|| {
+        format!(
+            "refs {}",
+            format_context_total(app.refs_total, app.token_config.decimals)
+        )
+    });
+    let full = [
+        mode.as_str(),
+        &format!("{path}{dirty}"),
+        app.status.as_str(),
+        refs.as_deref().unwrap_or(""),
+        &location,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join("  ");
+    if full.chars().count() <= usize::from(width) {
+        return format!(" {full}");
+    }
+    let compact = [mode.as_str(), refs.as_deref().unwrap_or(""), &location]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("  ");
+    if compact.chars().count() <= usize::from(width) {
+        format!(" {compact}")
+    } else {
+        format!(" {mode} {location}")
     }
 }
 
@@ -578,25 +688,23 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
     frame.render_widget(app.editor.view(), rows[0]);
-    let mode = format!("{:?}", app.editor.mode()).to_uppercase();
-    let path = app
-        .save_target
-        .as_ref()
-        .map_or("[No Name]".into(), |target| {
-            target.logical_path().display().to_string()
-        });
-    let dirty = if app.document.is_dirty() { " [+]" } else { "" };
+    if let Some((cursor, gutter_width)) = app.editor.current_line_number_override() {
+        frame.render_widget(
+            Paragraph::new("0").style(if app.color {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            }),
+            Rect::new(rows[0].x, cursor.y, gutter_width, 1),
+        );
+    }
     let command = app
         .editor
         .command_line()
         .map(|line| format!(":{line}"))
         .unwrap_or_default();
     let status = if command.is_empty() {
-        format!(
-            " {mode}  {path}{dirty}  {}  refs {}",
-            app.status,
-            format_context_total(app.refs_total)
-        )
+        status_text(app, rows[1].width)
     } else {
         command
     };
@@ -637,7 +745,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 } else {
                     Style::default()
                 };
-                ListItem::new(candidate_text(candidate)).style(style)
+                ListItem::new(candidate_text(candidate, &app.token_config)).style(style)
             })
             .collect::<Vec<_>>();
         frame.render_widget(
@@ -680,6 +788,7 @@ pub fn run(startup: Startup) -> Result<()> {
         let mut terminal = Terminal::new(CrosstermBackend::new(guard.backend_mut().writer_mut()))?;
         loop {
             app.drain_reference_events();
+            app.tick(Instant::now());
             terminal.draw(|frame| draw(frame, &mut app))?;
             if let Some(text) = app.pending_clipboard.take() {
                 write!(
@@ -709,8 +818,8 @@ fn centered_preview_scroll(one_based_line: usize) -> usize {
     one_based_line.saturating_sub(6)
 }
 
-fn format_context_total(total: ContextTotal) -> String {
-    let mut text = format_tokens(total.ready_tokens);
+fn format_context_total(total: ContextTotal, decimals: u8) -> String {
+    let mut text = format_token_count(total.ready_tokens, decimals);
     if total.pending > 0 {
         text.push_str(" + …");
     }
@@ -718,6 +827,14 @@ fn format_context_total(total: ContextTotal) -> String {
         text.push_str(" + unavailable");
     }
     text
+}
+
+fn format_token_count(tokens: usize, decimals: u8) -> String {
+    if tokens < 1_000 {
+        tokens.to_string()
+    } else {
+        format!("{:.*}k", usize::from(decimals), tokens as f64 / 1_000.0)
+    }
 }
 
 #[cfg(test)]
@@ -811,6 +928,73 @@ mod tests {
     #[test]
     fn preview_is_manual_by_default() {
         assert_eq!(Config::default().ui.preview, PreviewMode::Manual);
+    }
+
+    #[test]
+    fn token_precision_visibility_and_dual_symbol_costs_follow_config() {
+        use crate::references::model::{CandidateDisplay, GenerationId};
+
+        let candidate = ReferenceCandidate {
+            id: CandidateId {
+                provider: ReferenceKind::Symbol,
+                opaque: "symbol".into(),
+            },
+            generation: GenerationId(1),
+            kind: ReferenceKind::Symbol,
+            friendly_text: "@file.rs::item".into(),
+            display: CandidateDisplay {
+                primary: "item".into(),
+                ..CandidateDisplay::default()
+            },
+            context_cost: ContextCost::Tokens(1_234),
+            file_context_cost: Some(ContextCost::Tokens(18_765)),
+            source_version: None,
+            token_source: None,
+        };
+        let mut config = Config::default().tokens;
+        config.decimals = 2;
+        assert_eq!(
+            candidate_text(&candidate, &config),
+            "item · symbol 1.23k · file 18.77k"
+        );
+        config.show_symbol = false;
+        assert_eq!(candidate_text(&candidate, &config), "item · file 18.77k");
+        config.show_file = false;
+        assert_eq!(candidate_text(&candidate, &config), "item");
+    }
+
+    #[test]
+    fn status_expires_transient_messages_and_elides_details_when_narrow() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.ui.status_timeout_ms = 10;
+        config.tokens.show_total = false;
+        let mut app = app_for(temp.path(), &config, "hello");
+        app.status = "Written".into();
+        let started = Instant::now();
+        app.tick(started);
+        assert!(status_text(&app, 120).contains("1:1"));
+        app.tick(started + Duration::from_millis(11));
+        assert!(app.status.is_empty());
+        app.status = "a deliberately long transient status".into();
+        let narrow = status_text(&app, 12);
+        assert!(!narrow.contains("deliberately"));
+        assert!(narrow.contains("1:1"));
+    }
+
+    #[test]
+    fn automatic_preview_waits_for_the_configured_debounce() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.ui.preview = PreviewMode::Automatic;
+        config.search.debounce_ms = 80;
+        let mut app = app_for(temp.path(), &config, "");
+        app.schedule_preview();
+        let due = app.preview_due.expect("preview deadline");
+        app.tick(due - Duration::from_millis(1));
+        assert!(app.preview_due.is_some());
+        app.tick(due);
+        assert!(app.preview_due.is_none());
     }
 
     #[test]

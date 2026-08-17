@@ -4,8 +4,9 @@
 //! Project history, Visual Block operations, registers, and missing text
 //! operators live here instead of depending on edtui's private state.
 
+use crate::config::{EditorConfig, LineNumbers as ConfigLineNumbers};
 use crate::references::model::TextRange;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use edtui::{
     EditorEventHandler, EditorMode, EditorState, EditorView, Highlight, Index2, LineNumbers, Lines,
@@ -106,6 +107,17 @@ pub struct EditorSession {
     registers: HashMap<char, RegisterValue>,
     register_prefix: bool,
     selected_register: char,
+    line_numbers: LineNumbers,
+    current_line_absolute: bool,
+    tab_width: usize,
+    wrap: bool,
+    preview_toggle: KeyBinding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyBinding {
+    code: KeyCode,
+    modifiers: KeyModifiers,
 }
 
 impl EditorSession {
@@ -122,7 +134,28 @@ impl EditorSession {
             registers: HashMap::new(),
             register_prefix: false,
             selected_register: '"',
+            line_numbers: LineNumbers::Relative,
+            current_line_absolute: true,
+            tab_width: 4,
+            wrap: true,
+            preview_toggle: KeyBinding {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::CONTROL,
+            },
         }
+    }
+
+    pub fn configure(&mut self, editor: &EditorConfig, preview_toggle: &str) -> Result<()> {
+        self.line_numbers = match editor.line_numbers {
+            ConfigLineNumbers::Relative => LineNumbers::Relative,
+            ConfigLineNumbers::Absolute => LineNumbers::Absolute,
+            ConfigLineNumbers::None => LineNumbers::None,
+        };
+        self.current_line_absolute = editor.current_line_absolute;
+        self.tab_width = usize::from(editor.tab_width);
+        self.wrap = editor.wrap;
+        self.preview_toggle = parse_key_binding(preview_toggle)?;
+        Ok(())
     }
 
     pub fn text(&self) -> String {
@@ -184,6 +217,16 @@ impl EditorSession {
         self.state.cursor_screen_position()
     }
 
+    pub fn current_line_number_override(&self) -> Option<(Position, u16)> {
+        (self.line_numbers == LineNumbers::Relative && !self.current_line_absolute).then(|| {
+            (
+                self.cursor_screen_position()
+                    .expect("rendered editor cursor has a screen position"),
+                (self.state.lines.len().max(1).to_string().len() + 1) as u16,
+            )
+        })
+    }
+
     pub fn focus(&mut self) {
         self.focused = true;
     }
@@ -196,10 +239,11 @@ impl EditorSession {
         self.focused
     }
 
-    /// Returns the standard tg editor view: relative numbers with an absolute
-    /// number on the cursor row.
     pub fn view(&mut self) -> EditorView<'_, '_> {
-        EditorView::new(&mut self.state).line_numbers(LineNumbers::Relative)
+        EditorView::new(&mut self.state)
+            .line_numbers(self.line_numbers)
+            .tab_width(self.tab_width)
+            .wrap(self.wrap)
     }
 
     pub fn snapshot(&self) -> EditorSnapshot {
@@ -276,7 +320,7 @@ impl EditorSession {
             if self.command_line.is_some() {
                 return self.handle_command_key(key);
             }
-            if completion_active && is_ctrl_p(key) {
+            if completion_active && self.preview_toggle.matches(key) {
                 return EditorInput::TogglePreview;
             }
             if self.register_prefix {
@@ -904,8 +948,32 @@ impl Default for EditorSession {
     }
 }
 
-fn is_ctrl_p(key: KeyEvent) -> bool {
-    key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::CONTROL
+impl KeyBinding {
+    fn matches(self, key: KeyEvent) -> bool {
+        self.code == key.code && self.modifiers == key.modifiers
+    }
+}
+
+fn parse_key_binding(notation: &str) -> Result<KeyBinding> {
+    let (modifier, key) = notation
+        .split_once('-')
+        .context("preview toggle must use modifier-key notation")?;
+    let modifiers = match modifier.to_ascii_lowercase().as_str() {
+        "ctrl" => KeyModifiers::CONTROL,
+        "alt" => KeyModifiers::ALT,
+        "shift" => KeyModifiers::SHIFT,
+        "meta" => KeyModifiers::META,
+        _ => return Err(anyhow::anyhow!("unknown preview-toggle modifier")),
+    };
+    let code = match key.to_ascii_lowercase().as_str() {
+        "enter" => KeyCode::Enter,
+        "tab" => KeyCode::Tab,
+        "esc" | "escape" => KeyCode::Esc,
+        "space" => KeyCode::Char(' '),
+        value if value.chars().count() == 1 => KeyCode::Char(value.chars().next().unwrap()),
+        _ => return Err(anyhow::anyhow!("unknown preview-toggle key")),
+    };
+    Ok(KeyBinding { code, modifiers })
 }
 
 fn is_ctrl_v(key: KeyEvent) -> bool {
@@ -1199,6 +1267,36 @@ mod tests {
         session.handle_event(key(KeyCode::Char(':')), false);
         assert_eq!(session.text(), ":text");
         assert_eq!(session.mode(), AdapterMode::Insert);
+    }
+
+    #[test]
+    fn editor_render_and_preview_key_options_are_configurable() {
+        let mut session = EditorSession::new("one\ttwo\nthree");
+        let mut config = EditorConfig::default();
+        config.line_numbers = ConfigLineNumbers::None;
+        config.current_line_absolute = false;
+        config.tab_width = 8;
+        config.wrap = false;
+        session.configure(&config, "ctrl-x").unwrap();
+
+        assert_eq!(session.line_numbers, LineNumbers::None);
+        assert!(!session.current_line_absolute);
+        assert_eq!(session.tab_width, 8);
+        assert!(!session.wrap);
+        assert_eq!(
+            session.handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+                true,
+            ),
+            EditorInput::TogglePreview
+        );
+        assert_ne!(
+            session.handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+                true,
+            ),
+            EditorInput::TogglePreview
+        );
     }
 
     #[test]
