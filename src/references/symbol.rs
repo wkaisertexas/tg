@@ -1,8 +1,9 @@
 use super::file::{file_version, read_versioned};
 use super::model::{
-    CandidateDisplay, CandidateId, ContextCost, FileOrigin, FileTarget, FileVersion, Preview,
-    PreviewLine, QueryEmission, QueryProgress, QueryRequest, QueryScope, ReferenceCandidate,
-    ReferenceKind, ReferenceTarget, SourceLocation, SymbolIdentity, SymbolTarget, ValidatedTarget,
+    CandidateDisplay, CandidateId, CandidateTokenSource, ContextCost, FileOrigin, FileTarget,
+    FileVersion, Preview, PreviewLine, QueryEmission, QueryProgress, QueryRequest, QueryScope,
+    ReferenceCandidate, ReferenceKind, ReferenceTarget, SourceLocation, SymbolIdentity,
+    SymbolTarget, ValidatedTarget,
 };
 use super::{CancellationFlag, ReferenceProvider};
 use crate::language::{self, ParsedFile, Symbol};
@@ -167,6 +168,11 @@ impl SymbolProvider {
             context_cost: ContextCost::Pending,
             file_context_cost: Some(ContextCost::Pending),
             source_version: Some(entry.source_version.clone()),
+            token_source: Some(CandidateTokenSource::Symbol {
+                path: entry.canonical_path.clone(),
+                start_byte: symbol.range_start_byte,
+                end_byte: symbol.range_end_byte,
+            }),
         }
     }
 
@@ -688,6 +694,18 @@ mod tests {
         assert!(target.name_end_byte <= target.end_byte);
         assert_eq!(target.file.origin, FileOrigin::GitAware);
         assert_eq!(child[0].source_version, target.file.source_version);
+        assert_eq!(child[0].context_cost, ContextCost::Pending);
+        assert_eq!(child[0].file_context_cost, Some(ContextCost::Pending));
+        assert!(matches!(
+            &child[0].token_source,
+            Some(CandidateTokenSource::Symbol {
+                path: candidate_path,
+                start_byte,
+                end_byte,
+            }) if candidate_path == &path.canonicalize().unwrap()
+                && *start_byte == target.start_byte
+                && *end_byte == target.end_byte
+        ));
     }
 
     #[test]

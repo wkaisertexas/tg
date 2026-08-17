@@ -1,11 +1,16 @@
 use super::activation::{LoweredSnapshot, lower_snapshot};
 use super::model::{
-    AcceptedReference, CandidateId, CompletionActivation, GenerationId, LoweredReference, Preview,
-    QueryEmission, QueryProgress, QueryRequest, ReferenceCandidate, ReferenceId, ReferenceKind,
-    ResolvedReference, SessionUpdate, SharedProvider, TextRange,
+    AcceptedReference, CandidateId, CandidateTokenSource, CompletionActivation, ContextCost,
+    GenerationId, LoweredReference, Preview, QueryEmission, QueryProgress, QueryRequest,
+    ReferenceCandidate, ReferenceId, ReferenceKind, ReferenceTarget, ResolvedReference,
+    SessionUpdate, SharedProvider, TextRange,
 };
 use super::{BackgroundExecutor, CancellationFlag, ReferenceProvider};
 use crate::config::LeadersConfig;
+use crate::tokens::{
+    self, ContextFileVersion, ContextIdentity, ContextTotal, ReferenceContext, TokenGeneration,
+    TokenRequestId, TokenService, TokenState, TokenSubject,
+};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -56,6 +61,13 @@ pub enum ReferenceEvent {
         revision: Option<DocumentRevision>,
         reference_id: Option<ReferenceId>,
         message: String,
+    },
+    CandidateCostsChanged {
+        generation: GenerationId,
+    },
+    ContextTotalChanged {
+        revision: DocumentRevision,
+        total: ContextTotal,
     },
 }
 
@@ -117,6 +129,23 @@ struct PendingLower {
     cancellation: CancellationFlag,
 }
 
+#[derive(Clone, Copy)]
+enum CandidateCostSlot {
+    Context,
+    File,
+}
+
+struct PendingCandidateCost {
+    generation: GenerationId,
+    candidate_id: CandidateId,
+    slot: CandidateCostSlot,
+}
+
+struct PendingReferenceCost {
+    revision: DocumentRevision,
+    identity: ContextIdentity,
+}
+
 pub struct ReferenceSession {
     providers: HashMap<ReferenceKind, SharedProvider>,
     executor: Arc<dyn BackgroundExecutor>,
@@ -135,12 +164,24 @@ pub struct ReferenceSession {
     pending_preview: Option<PendingPreview>,
     pending_lower: Option<PendingLower>,
     ready_events: VecDeque<ReferenceEvent>,
+    token_service: TokenService,
+    pending_candidate_costs: HashMap<TokenRequestId, PendingCandidateCost>,
+    reference_contexts: Vec<ReferenceContext>,
+    pending_reference_costs: HashMap<TokenRequestId, PendingReferenceCost>,
 }
 
 impl ReferenceSession {
     pub fn new(
         providers: impl IntoIterator<Item = Arc<dyn ReferenceProvider>>,
         executor: Arc<dyn BackgroundExecutor>,
+    ) -> Result<Self> {
+        Self::with_tokenizer(providers, executor, tokens::GPT4O_TOKENIZER)
+    }
+
+    pub fn with_tokenizer(
+        providers: impl IntoIterator<Item = Arc<dyn ReferenceProvider>>,
+        executor: Arc<dyn BackgroundExecutor>,
+        tokenizer: &str,
     ) -> Result<Self> {
         let mut registry = HashMap::new();
         for provider in providers {
@@ -150,6 +191,7 @@ impl ReferenceSession {
             );
         }
         let (sender, receiver) = mpsc::channel();
+        let token_service = TokenService::for_tokenizer(Arc::clone(&executor), tokenizer)?;
         Ok(Self {
             providers: registry,
             executor,
@@ -168,6 +210,10 @@ impl ReferenceSession {
             pending_preview: None,
             pending_lower: None,
             ready_events: VecDeque::new(),
+            token_service,
+            pending_candidate_costs: HashMap::new(),
+            reference_contexts: Vec::new(),
+            pending_reference_costs: HashMap::new(),
         })
     }
 
@@ -218,6 +264,7 @@ impl ReferenceSession {
         self.cancel_accept();
         self.cancel_preview();
         self.cancel_current();
+        self.pending_candidate_costs.clear();
         self.advance_generation();
         self.candidates.clear();
         self.selected = 0;
@@ -263,6 +310,7 @@ impl ReferenceSession {
         self.active_kind = None;
         self.active_range = None;
         self.candidates.clear();
+        self.pending_candidate_costs.clear();
         self.selected = 0;
     }
 
@@ -299,9 +347,20 @@ impl ReferenceSession {
                             && candidate.kind == active_kind
                             && candidate.id.provider == active_kind
                     }) {
+                        let mut candidates = candidates;
+                        for candidate in &mut candidates {
+                            if let Some(previous) = self.candidates.iter().find(|previous| {
+                                previous.id == candidate.id
+                                    && previous.source_version == candidate.source_version
+                            }) {
+                                candidate.context_cost = previous.context_cost.clone();
+                                candidate.file_context_cost = previous.file_context_cost.clone();
+                            }
+                        }
                         self.candidates = candidates;
                         self.selected = self.selected.min(self.candidates.len().saturating_sub(1));
                         self.cancel_preview();
+                        self.schedule_candidate_costs();
                         update.candidates_changed = true;
                         update.completed |= completed;
                         update.progress = progress.or(update.progress);
@@ -422,6 +481,7 @@ impl ReferenceSession {
                 _ => {}
             }
         }
+        self.drain_token_updates();
         update
     }
 
@@ -461,9 +521,47 @@ impl ReferenceSession {
 
     pub fn document_changed(&mut self, revision: DocumentRevision) {
         self.document_revision = revision;
+        self.pending_reference_costs.clear();
         self.cancel_accept();
         self.cancel_lower();
         self.close();
+    }
+
+    pub fn update_references(
+        &mut self,
+        revision: DocumentRevision,
+        references: Arc<[ResolvedReference]>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            revision == self.document_revision,
+            "reference update uses a stale document revision"
+        );
+        let old = std::mem::take(&mut self.reference_contexts);
+        self.pending_reference_costs.clear();
+        self.reference_contexts = references
+            .iter()
+            .filter_map(reference_context)
+            .map(|mut context| {
+                if let Some(previous) = old
+                    .iter()
+                    .find(|previous| previous.identity == context.identity)
+                {
+                    context.state = previous.state.clone();
+                }
+                context
+            })
+            .collect();
+        self.schedule_reference_costs(revision);
+        self.ready_events
+            .push_back(ReferenceEvent::ContextTotalChanged {
+                revision,
+                total: self.context_total(),
+            });
+        Ok(())
+    }
+
+    pub fn context_total(&self) -> ContextTotal {
+        tokens::context_total(&self.reference_contexts)
     }
 
     pub fn cancel_operation(&mut self, request_id: OperationRequestId) {
@@ -670,6 +768,173 @@ impl ReferenceSession {
             .with_context(|| format!("no provider registered for {kind:?}"))
     }
 
+    fn schedule_candidate_costs(&mut self) {
+        let generation = self.generation;
+        let revision = self.document_revision;
+        let existing = |id: &CandidateId, slot: CandidateCostSlot, pending: &HashMap<_, _>| {
+            pending.values().any(|request: &PendingCandidateCost| {
+                request.generation == generation
+                    && request.candidate_id == *id
+                    && std::mem::discriminant(&request.slot) == std::mem::discriminant(&slot)
+            })
+        };
+        let work = self
+            .candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .token_source
+                    .clone()
+                    .map(|source| (candidate, source))
+            })
+            .flat_map(|(candidate, source)| {
+                let mut work = Vec::new();
+                if candidate.context_cost == ContextCost::Pending
+                    && !existing(
+                        &candidate.id,
+                        CandidateCostSlot::Context,
+                        &self.pending_candidate_costs,
+                    )
+                {
+                    work.push((
+                        candidate.id.clone(),
+                        CandidateCostSlot::Context,
+                        source.clone(),
+                    ));
+                }
+                if matches!(source, CandidateTokenSource::Symbol { .. })
+                    && candidate.file_context_cost == Some(ContextCost::Pending)
+                    && !existing(
+                        &candidate.id,
+                        CandidateCostSlot::File,
+                        &self.pending_candidate_costs,
+                    )
+                {
+                    work.push((candidate.id.clone(), CandidateCostSlot::File, source));
+                }
+                work
+            })
+            .collect::<Vec<_>>();
+        for (candidate_id, slot, source) in work {
+            let subject = TokenSubject(candidate_id.opaque.clone());
+            let ticket = match (&source, slot) {
+                (CandidateTokenSource::File { path }, CandidateCostSlot::Context)
+                | (CandidateTokenSource::Symbol { path, .. }, CandidateCostSlot::File) => {
+                    self.token_service.request_file(
+                        path.clone(),
+                        TokenGeneration(generation.0),
+                        tokens::DocumentRevision(revision.0),
+                        subject,
+                    )
+                }
+                (
+                    CandidateTokenSource::Symbol {
+                        path,
+                        start_byte,
+                        end_byte,
+                    },
+                    CandidateCostSlot::Context,
+                ) => self.token_service.request_file_range(
+                    path.clone(),
+                    *start_byte..*end_byte,
+                    TokenGeneration(generation.0),
+                    tokens::DocumentRevision(revision.0),
+                    subject,
+                ),
+                (CandidateTokenSource::File { .. }, CandidateCostSlot::File) => continue,
+            };
+            self.pending_candidate_costs.insert(
+                ticket.id,
+                PendingCandidateCost {
+                    generation,
+                    candidate_id,
+                    slot,
+                },
+            );
+        }
+    }
+
+    fn schedule_reference_costs(&mut self, revision: DocumentRevision) {
+        let identities = self
+            .reference_contexts
+            .iter()
+            .filter(|context| context.state == TokenState::Pending)
+            .filter_map(|context| context.identity.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for identity in identities {
+            let ticket = match &identity {
+                ContextIdentity::File(path) => self.token_service.request_file(
+                    path.clone(),
+                    TokenGeneration(0),
+                    tokens::DocumentRevision(revision.0),
+                    TokenSubject("reference-file".into()),
+                ),
+                ContextIdentity::Range {
+                    canonical_path,
+                    start_byte,
+                    end_byte,
+                    ..
+                } => self.token_service.request_file_range(
+                    canonical_path.clone(),
+                    *start_byte..*end_byte,
+                    TokenGeneration(0),
+                    tokens::DocumentRevision(revision.0),
+                    TokenSubject("reference-range".into()),
+                ),
+            };
+            self.pending_reference_costs
+                .insert(ticket.id, PendingReferenceCost { revision, identity });
+        }
+    }
+
+    fn drain_token_updates(&mut self) {
+        let mut candidates_changed = false;
+        let mut total_changed = false;
+        for update in self.token_service.drain() {
+            if let Some(pending) = self.pending_candidate_costs.remove(&update.id)
+                && pending.generation == self.generation
+                && update.generation == TokenGeneration(self.generation.0)
+                && update.revision == tokens::DocumentRevision(self.document_revision.0)
+                && let Some(candidate) = self
+                    .candidates
+                    .iter_mut()
+                    .find(|candidate| candidate.id == pending.candidate_id)
+            {
+                let cost = context_cost(update.state);
+                match pending.slot {
+                    CandidateCostSlot::Context => candidate.context_cost = cost,
+                    CandidateCostSlot::File => candidate.file_context_cost = Some(cost),
+                }
+                candidates_changed = true;
+                continue;
+            }
+            if let Some(pending) = self.pending_reference_costs.remove(&update.id)
+                && pending.revision == self.document_revision
+                && update.revision == tokens::DocumentRevision(self.document_revision.0)
+            {
+                for context in &mut self.reference_contexts {
+                    if context.identity.as_ref() == Some(&pending.identity) {
+                        context.state = update.state.clone();
+                    }
+                }
+                total_changed = true;
+            }
+        }
+        if candidates_changed {
+            self.ready_events
+                .push_back(ReferenceEvent::CandidateCostsChanged {
+                    generation: self.generation,
+                });
+        }
+        if total_changed {
+            self.ready_events
+                .push_back(ReferenceEvent::ContextTotalChanged {
+                    revision: self.document_revision,
+                    total: self.context_total(),
+                });
+        }
+    }
+
     fn cancel_current(&mut self) {
         if let Some(cancellation) = self.cancellation.take() {
             cancellation.cancel();
@@ -756,6 +1021,39 @@ impl ReferenceSession {
     }
 }
 
+fn context_cost(state: TokenState) -> ContextCost {
+    match state {
+        TokenState::Pending => ContextCost::Pending,
+        TokenState::Ready(tokens) => ContextCost::Tokens(tokens),
+        TokenState::Bytes(bytes) => ContextCost::Bytes(bytes),
+        TokenState::Unavailable => ContextCost::Unavailable,
+    }
+}
+
+fn reference_context(reference: &ResolvedReference) -> Option<ReferenceContext> {
+    let identity = match &reference.target {
+        ReferenceTarget::File(file) => ContextIdentity::File(file.canonical_path.clone()),
+        ReferenceTarget::Symbol(symbol) => {
+            let version = symbol.file.source_version.as_ref()?;
+            ContextIdentity::Range {
+                canonical_path: symbol.file.canonical_path.clone(),
+                start_byte: symbol.start_byte,
+                end_byte: symbol.end_byte,
+                file_version: ContextFileVersion {
+                    size: version.size,
+                    modified: version.modified,
+                    content_sha256: version.content_sha256,
+                },
+            }
+        }
+        ReferenceTarget::Skill(_) | ReferenceTarget::ExternalUrl(_) => return None,
+    };
+    Some(ReferenceContext {
+        identity: Some(identity),
+        state: TokenState::Pending,
+    })
+}
+
 fn target_kind(target: &super::model::ReferenceTarget) -> ReferenceKind {
     match target {
         super::model::ReferenceTarget::File(file) => match file.origin {
@@ -772,8 +1070,8 @@ fn target_kind(target: &super::model::ReferenceTarget) -> ReferenceKind {
 mod tests {
     use super::*;
     use crate::references::model::{
-        CandidateDisplay, CandidateId, ContextCost, FileOrigin, FileTarget, Preview, PreviewLine,
-        QueryScope, ReferenceTarget, ValidatedTarget,
+        CandidateDisplay, CandidateId, CandidateTokenSource, ContextCost, FileOrigin, FileTarget,
+        Preview, PreviewLine, QueryScope, ReferenceTarget, ValidatedTarget,
     };
     use crate::references::{CancellationFlag, ThreadExecutor};
     use anyhow::bail;
@@ -796,6 +1094,10 @@ mod tests {
     }
 
     impl ManualExecutor {
+        fn len(&self) -> usize {
+            self.jobs.lock().unwrap().len()
+        }
+
         fn run(&self, index: usize) {
             let job = self.jobs.lock().unwrap().remove(index);
             job();
@@ -892,10 +1194,11 @@ mod tests {
     struct FakeProvider {
         saw_cancellation: Arc<AtomicBool>,
         thread_sender: Option<Sender<ThreadId>>,
+        token_path: Option<std::path::PathBuf>,
     }
 
     impl FakeProvider {
-        fn candidate(request: &QueryRequest) -> ReferenceCandidate {
+        fn candidate(&self, request: &QueryRequest) -> ReferenceCandidate {
             ReferenceCandidate {
                 id: CandidateId {
                     provider: ReferenceKind::GitFile,
@@ -911,6 +1214,10 @@ mod tests {
                 context_cost: ContextCost::Pending,
                 file_context_cost: None,
                 source_version: None,
+                token_source: self
+                    .token_path
+                    .clone()
+                    .map(|path| CandidateTokenSource::File { path }),
             }
         }
     }
@@ -932,7 +1239,7 @@ mod tests {
                 self.saw_cancellation.store(true, Ordering::Release);
                 return Ok(Vec::new());
             }
-            Ok(vec![Self::candidate(&request)])
+            Ok(vec![self.candidate(&request)])
         }
 
         fn query_progressive(
@@ -980,6 +1287,7 @@ mod tests {
         Arc::new(FakeProvider {
             saw_cancellation: cancelled,
             thread_sender: None,
+            token_path: None,
         })
     }
 
@@ -1025,6 +1333,7 @@ mod tests {
                 context_cost: ContextCost::None,
                 file_context_cost: None,
                 source_version: None,
+                token_source: None,
             })
             .collect();
         (session, executor, calls)
@@ -1093,12 +1402,139 @@ mod tests {
         let provider: Arc<dyn ReferenceProvider> = Arc::new(FakeProvider {
             saw_cancellation: Arc::new(AtomicBool::new(false)),
             thread_sender: Some(sender),
+            token_path: None,
         });
         let mut session = ReferenceSession::new([provider], Arc::new(ThreadExecutor)).unwrap();
         start(&mut session, "threaded");
 
         let provider_thread = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_ne!(provider_thread, main_thread);
+    }
+
+    #[test]
+    fn candidate_file_cost_arrives_as_an_async_candidate_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tokens.txt");
+        std::fs::write(&path, "hello world").unwrap();
+        let executor = Arc::new(ManualExecutor::default());
+        let provider: Arc<dyn ReferenceProvider> = Arc::new(FakeProvider {
+            saw_cancellation: Arc::new(AtomicBool::new(false)),
+            thread_sender: None,
+            token_path: Some(path),
+        });
+        let mut session = ReferenceSession::new([provider], executor.clone()).unwrap();
+
+        start(&mut session, "tokens");
+        executor.run_on_background_thread(0);
+        session.drain_events();
+        assert_eq!(session.candidates()[0].context_cost, ContextCost::Pending);
+
+        executor.run_on_background_thread(0);
+        let events = session.drain_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ReferenceEvent::CandidateCostsChanged { generation }
+                if *generation == session.generation()
+        )));
+        assert_eq!(session.candidates()[0].context_cost, ContextCost::Tokens(2));
+    }
+
+    #[test]
+    fn stale_candidate_cost_cannot_update_a_new_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tokens.txt");
+        std::fs::write(&path, "hello world").unwrap();
+        let executor = Arc::new(ManualExecutor::default());
+        let provider: Arc<dyn ReferenceProvider> = Arc::new(FakeProvider {
+            saw_cancellation: Arc::new(AtomicBool::new(false)),
+            thread_sender: None,
+            token_path: Some(path),
+        });
+        let mut session = ReferenceSession::new([provider], executor.clone()).unwrap();
+
+        start(&mut session, "old");
+        executor.run_on_background_thread(0);
+        session.drain_events();
+        start(&mut session, "new");
+        executor.run_on_background_thread(1);
+        session.drain_events();
+
+        executor.run_on_background_thread(0);
+        assert!(
+            session
+                .drain_events()
+                .iter()
+                .all(|event| !matches!(event, ReferenceEvent::CandidateCostsChanged { .. }))
+        );
+        assert_eq!(session.candidates()[0].display.primary, "new");
+        assert_eq!(session.candidates()[0].context_cost, ContextCost::Pending);
+
+        executor.run_on_background_thread(0);
+        session.drain_events();
+        assert_eq!(session.candidates()[0].context_cost, ContextCost::Tokens(2));
+    }
+
+    #[test]
+    fn live_context_total_deduplicates_and_whole_file_subsumes_symbol() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("context.rs");
+        std::fs::write(&path, "hello world").unwrap();
+        let version = crate::references::file::file_version(&path).unwrap();
+        let file_target = FileTarget {
+            canonical_path: path.clone(),
+            relative_path: "context.rs".into(),
+            origin: FileOrigin::GitAware,
+            source_version: Some(version.clone()),
+        };
+        let whole = |id| ResolvedReference {
+            id: ReferenceId(id),
+            range: TextRange::new(0, 1).unwrap(),
+            friendly_text: "@context.rs".into(),
+            target: ReferenceTarget::File(file_target.clone()),
+        };
+        let symbol = ResolvedReference {
+            id: ReferenceId(3),
+            range: TextRange::new(0, 1).unwrap(),
+            friendly_text: "@context.rs::hello".into(),
+            target: ReferenceTarget::Symbol(crate::references::model::SymbolTarget {
+                file: file_target.clone(),
+                identity: crate::references::model::SymbolIdentity {
+                    language: "rs".into(),
+                    qualified_name: "hello".into(),
+                    leaf_name: "hello".into(),
+                    kind: "function".into(),
+                    is_definition: true,
+                },
+                start_byte: 0,
+                end_byte: 5,
+                name_start_byte: 0,
+                name_end_byte: 5,
+                location: crate::references::model::SourceLocation { line: 1, column: 1 },
+                markdown_anchor: None,
+            }),
+        };
+        let executor = Arc::new(ManualExecutor::default());
+        let mut session = ReferenceSession::new(
+            [provider(Arc::new(AtomicBool::new(false)))],
+            executor.clone(),
+        )
+        .unwrap();
+        session
+            .update_references(DocumentRevision(0), vec![whole(1), whole(2), symbol].into())
+            .unwrap();
+        assert_eq!(session.context_total().pending, 1);
+
+        while executor.len() > 0 {
+            executor.run_on_background_thread(0);
+        }
+        let events = session.drain_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ReferenceEvent::ContextTotalChanged { total, .. }
+                if total.ready_tokens == 2 && total.pending == 0
+        )));
+        assert_eq!(session.context_total().ready_tokens, 2);
+        assert_eq!(session.context_total().pending, 0);
     }
 
     #[test]
@@ -1162,6 +1598,7 @@ mod tests {
                 context_cost: ContextCost::None,
                 file_context_cost: None,
                 source_version: None,
+                token_source: None,
             })
             .collect();
         session.begin_preview_selected().unwrap();

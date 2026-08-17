@@ -70,6 +70,19 @@ pub struct ReferenceCandidate {
     pub context_cost: ContextCost,
     pub file_context_cost: Option<ContextCost>,
     pub source_version: Option<FileVersion>,
+    pub token_source: Option<CandidateTokenSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateTokenSource {
+    File {
+        path: PathBuf,
+    },
+    Symbol {
+        path: PathBuf,
+        start_byte: usize,
+        end_byte: usize,
+    },
 }
 
 #[derive(Debug, Clone, Default)]

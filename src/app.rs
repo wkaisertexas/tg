@@ -11,6 +11,7 @@ use crate::references::session::{
 };
 use crate::references::symbol::SymbolProvider;
 use crate::repository::Repository;
+use crate::tokens::{ContextTotal, format_tokens};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -49,6 +50,7 @@ struct App {
     submitting: bool,
     exit_after_submit: bool,
     should_exit: bool,
+    refs_total: ContextTotal,
 }
 
 impl App {
@@ -68,13 +70,14 @@ impl App {
         )?;
         let indexed_files = broad.files().len();
         let symbols = SymbolProvider::new(&repo.search_root, config.leaders.files.clone())?;
-        let reference_session = ReferenceSession::new(
+        let reference_session = ReferenceSession::with_tokenizer(
             [
                 Arc::new(git) as Arc<dyn crate::references::ReferenceProvider>,
                 Arc::new(broad),
                 Arc::new(symbols),
             ],
             Arc::new(ThreadExecutor),
+            &config.tokens.tokenizer,
         )?;
         let status = format!(
             "{indexed_files} files indexed · {} mode",
@@ -101,6 +104,7 @@ impl App {
             submitting: false,
             exit_after_submit: false,
             should_exit: false,
+            refs_total: ContextTotal::default(),
         })
     }
 
@@ -111,6 +115,12 @@ impl App {
     fn edit_changed(&mut self) {
         self.revision.0 = self.revision.0.wrapping_add(1);
         self.reference_session.document_changed(self.revision);
+        if let Err(error) = self
+            .reference_session
+            .update_references(self.revision, self.references.clone().into())
+        {
+            self.status = format!("Cannot update reference total: {error}");
+        }
         self.preview = None;
         self.submitting = false;
         self.exit_after_submit = false;
@@ -214,6 +224,12 @@ impl App {
                     } else {
                         self.status = format!("Cannot {}: {message}", operation_name(kind));
                     }
+                }
+                ReferenceEvent::CandidateCostsChanged { .. } => {}
+                ReferenceEvent::ContextTotalChanged { revision, total }
+                    if revision == self.revision =>
+                {
+                    self.refs_total = total;
                 }
                 _ => {}
             }
@@ -584,7 +600,12 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         vertical[3],
     );
     frame.render_widget(
-        Paragraph::new(format!(" {}", app.status)).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(format!(
+            " {} · refs {}",
+            app.status,
+            format_context_total(app.refs_total)
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
         vertical[4],
     );
 }
@@ -646,6 +667,17 @@ fn is_completion_accept_key(code: KeyCode) -> bool {
 
 fn centered_preview_scroll(one_based_line: usize) -> usize {
     one_based_line.saturating_sub(6)
+}
+
+fn format_context_total(total: ContextTotal) -> String {
+    let mut text = format_tokens(total.ready_tokens);
+    if total.pending > 0 {
+        text.push_str(" + …");
+    }
+    if total.unavailable > 0 {
+        text.push_str(" + unavailable");
+    }
+    text
 }
 
 #[cfg(test)]
@@ -735,6 +767,7 @@ mod tests {
             context_cost: ContextCost::Tokens(1_234),
             file_context_cost: None,
             source_version: None,
+            token_source: None,
         };
         assert_eq!(candidate_text(&candidate), "gone  file · 1.2k");
     }

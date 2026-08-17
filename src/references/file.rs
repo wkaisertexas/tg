@@ -1,7 +1,7 @@
 use super::model::{
-    CandidateDisplay, CandidateId, ContextCost, FileOrigin, FileTarget, FileVersion, Preview,
-    PreviewLine, QueryRequest, QueryScope, ReferenceCandidate, ReferenceKind, ReferenceTarget,
-    ValidatedTarget,
+    CandidateDisplay, CandidateId, CandidateTokenSource, ContextCost, FileOrigin, FileTarget,
+    FileVersion, Preview, PreviewLine, QueryRequest, QueryScope, ReferenceCandidate, ReferenceKind,
+    ReferenceTarget, ValidatedTarget,
 };
 use super::{CancellationFlag, ReferenceProvider};
 use crate::search::{self, SearchMode};
@@ -102,6 +102,7 @@ impl ReferenceProvider for FileProvider {
                     context_cost: ContextCost::Pending,
                     file_context_cost: None,
                     source_version: None,
+                    token_source: Some(CandidateTokenSource::File { path: found.path }),
                 })
                 .collect(),
         )

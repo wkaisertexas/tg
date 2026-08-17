@@ -139,6 +139,14 @@ impl TokenService {
         Self::with_counter(executor, Arc::new(Gpt4oCounter))
     }
 
+    pub fn for_tokenizer(executor: Arc<dyn BackgroundExecutor>, tokenizer: &str) -> Result<Self> {
+        let tokenizer = TokenizerName::parse(tokenizer)?;
+        match tokenizer.as_str() {
+            GPT4O_TOKENIZER => Ok(Self::new(executor)),
+            _ => unreachable!("TokenizerName accepts only registered tokenizers"),
+        }
+    }
+
     pub fn with_counter(
         executor: Arc<dyn BackgroundExecutor>,
         counter: Arc<dyn TokenCounter>,
@@ -217,6 +225,47 @@ impl TokenService {
         }
     }
 
+    pub fn request_file_range(
+        &self,
+        path: PathBuf,
+        range: Range<usize>,
+        generation: TokenGeneration,
+        revision: DocumentRevision,
+        subject: TokenSubject,
+    ) -> TokenTicket {
+        let id = self.next_id();
+        let sender = self.sender.clone();
+        let cache = Arc::clone(&self.cache);
+        let counter = Arc::clone(&self.counter);
+        let tokenizer = self.tokenizer.clone();
+        self.executor.spawn(Box::new(move || {
+            let state = (|| {
+                let (file, bytes) = stable_file(&path)?;
+                let source = std::str::from_utf8(&bytes).context("source is not valid UTF-8")?;
+                count_range(
+                    file,
+                    source,
+                    SymbolRange::Bytes(range),
+                    &tokenizer,
+                    counter.as_ref(),
+                    &cache,
+                )
+            })()
+            .unwrap_or(TokenState::Unavailable);
+            let _ = sender.send(TokenUpdate {
+                id,
+                generation,
+                revision,
+                subject,
+                state,
+            });
+        }));
+        TokenTicket {
+            id,
+            state: TokenState::Pending,
+        }
+    }
+
     /// Drains completed work and rejects updates for superseded UI/document state.
     /// Stale jobs still populate the shared cache.
     pub fn drain_for(
@@ -224,10 +273,14 @@ impl TokenService {
         generation: TokenGeneration,
         revision: DocumentRevision,
     ) -> Vec<TokenUpdate> {
-        self.receiver
-            .try_iter()
+        self.drain()
+            .into_iter()
             .filter(|update| update.generation == generation && update.revision == revision)
             .collect()
+    }
+
+    pub fn drain(&self) -> Vec<TokenUpdate> {
+        self.receiver.try_iter().collect()
     }
 
     pub fn count_text(&self, text: &str) -> Result<usize> {
@@ -469,10 +522,33 @@ mod tests {
             let job = self.jobs.lock().unwrap().remove(0);
             job();
         }
+
+        fn run_next_on_background_thread(&self) {
+            let job = self.jobs.lock().unwrap().remove(0);
+            std::thread::spawn(job).join().unwrap();
+        }
     }
 
     struct CountingCounter {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct ThreadRecordingCounter {
+        threads: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+    }
+
+    impl TokenCounter for ThreadRecordingCounter {
+        fn name(&self) -> &str {
+            GPT4O_TOKENIZER
+        }
+
+        fn count(&self, text: &str) -> Result<usize> {
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            Ok(text.chars().count())
+        }
     }
 
     impl TokenCounter for CountingCounter {
@@ -544,6 +620,33 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         executor.run_next();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn counting_runs_off_the_caller_thread() {
+        let caller = std::thread::current().id();
+        let executor = Arc::new(ManualExecutor::default());
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let service = TokenService::with_counter(
+            executor.clone(),
+            Arc::new(ThreadRecordingCounter {
+                threads: threads.clone(),
+            }),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("thread.txt");
+        fs::write(&path, "content").unwrap();
+
+        request_file(&service, &path, 1, 1);
+        assert!(threads.lock().unwrap().is_empty());
+        executor.run_next_on_background_thread();
+        assert!(
+            threads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|thread| *thread != caller)
+        );
     }
 
     #[test]
