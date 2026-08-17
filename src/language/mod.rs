@@ -29,8 +29,12 @@ pub struct Symbol {
     pub qualified_name: String,
     pub kind: String,
     pub start: SourcePoint,
-    pub start_byte: usize,
-    pub end_byte: usize,
+    /// UTF-8 byte range of the identifier used for display and lowering.
+    pub name_start_byte: usize,
+    pub name_end_byte: usize,
+    /// UTF-8 byte range of the complete declaration or structural unit.
+    pub range_start_byte: usize,
+    pub range_end_byte: usize,
     pub is_definition: bool,
 }
 
@@ -178,11 +182,11 @@ fn parse_with_parser(
         &mut Vec::new(),
         &mut symbols,
     );
-    symbols.sort_unstable_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
+    symbols.sort_unstable_by_key(|symbol| (symbol.name_start_byte, symbol.name_end_byte));
     if matches!(flavor, Flavor::Cpp | Flavor::C)
         && supplement_c_family_declarations(&source, &mut symbols)
     {
-        symbols.sort_unstable_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
+        symbols.sort_unstable_by_key(|symbol| (symbol.name_start_byte, symbol.name_end_byte));
     }
     Ok(Some(ParsedFile { source, symbols }))
 }
@@ -277,9 +281,12 @@ fn parse_markdown_headings(source: &str) -> Vec<Symbol> {
                         &mut hierarchy,
                         hashes,
                         name,
-                        index + 1,
-                        indent + hashes + leading + 1,
+                        SourcePoint {
+                            line: index + 1,
+                            column: indent + hashes + leading + 1,
+                        },
                         offsets[index] + indent + hashes + leading,
+                        offsets[index] + indent..offsets[index] + without_newline.len(),
                     );
                 }
                 continue;
@@ -296,9 +303,13 @@ fn parse_markdown_headings(source: &str) -> Vec<Symbol> {
                     &mut hierarchy,
                     if trimmed.starts_with('=') { 1 } else { 2 },
                     name,
-                    index,
-                    column,
+                    SourcePoint {
+                        line: index,
+                        column,
+                    },
                     start_byte,
+                    offsets[index - 1] + previous.len() - previous.trim_start().len()
+                        ..offsets[index] + without_newline.len(),
                 );
             }
         }
@@ -317,9 +328,9 @@ fn push_markdown_heading(
     hierarchy: &mut Vec<(usize, String)>,
     level: usize,
     name: &str,
-    line: usize,
-    column: usize,
-    start_byte: usize,
+    start: SourcePoint,
+    name_start_byte: usize,
+    range: std::ops::Range<usize>,
 ) {
     while hierarchy
         .last()
@@ -333,9 +344,11 @@ fn push_markdown_heading(
         leaf_name: name.to_owned(),
         qualified_name: qualified.join("::"),
         kind: format!("heading {level}"),
-        start: SourcePoint { line, column },
-        start_byte,
-        end_byte: start_byte + name.len(),
+        start,
+        name_start_byte,
+        name_end_byte: name_start_byte + name.len(),
+        range_start_byte: range.start,
+        range_end_byte: range.end,
         is_definition: true,
     });
     hierarchy.push((level, name.to_owned()));
@@ -385,20 +398,22 @@ fn supplement_c_family_declarations(source: &str, symbols: &mut Vec<Symbol>) -> 
                 if line[..whole.start()].trim_end().ends_with("template<") {
                     continue;
                 }
-                let start_byte = byte_offset + name.start();
+                let name_start_byte = byte_offset + name.start();
                 let name_end = byte_offset + name.end();
                 if symbols[..original_len]
-                    .binary_search_by_key(&start_byte, |symbol| symbol.start_byte)
+                    .binary_search_by_key(&name_start_byte, |symbol| symbol.name_start_byte)
                     .is_ok()
-                    || added_offsets.contains(&start_byte)
+                    || added_offsets.contains(&name_start_byte)
                 {
                     continue;
                 }
-                added_offsets.push(start_byte);
+                added_offsets.push(name_start_byte);
                 let kind = captures.get(1).unwrap().as_str();
                 let tail = &source.as_bytes()[name_end..(name_end + 500).min(source.len())];
                 let brace = tail.iter().position(|byte| *byte == b'{');
                 let semicolon = tail.iter().position(|byte| *byte == b';');
+                let line_without_newline = line.trim_end_matches(['\r', '\n']);
+                let leading = line_without_newline.len() - line_without_newline.trim_start().len();
                 symbols.push(Symbol {
                     leaf_name: name.as_str().to_owned(),
                     qualified_name: name.as_str().to_owned(),
@@ -407,8 +422,10 @@ fn supplement_c_family_declarations(source: &str, symbols: &mut Vec<Symbol>) -> 
                         line: row + 1,
                         column: name.start() + 1,
                     },
-                    start_byte,
-                    end_byte: name_end,
+                    name_start_byte,
+                    name_end_byte: name_end,
+                    range_start_byte: byte_offset + leading,
+                    range_end_byte: byte_offset + line_without_newline.len(),
                     is_definition: brace
                         .is_some_and(|brace| semicolon.is_none_or(|semicolon| brace < semicolon)),
                 });
@@ -495,8 +512,10 @@ fn visit(
             qualified_name,
             kind: symbol_kind.to_owned(),
             start: name_node.start_position().into(),
-            start_byte: name_node.start_byte(),
-            end_byte: name_node.end_byte(),
+            name_start_byte: name_node.start_byte(),
+            name_end_byte: name_node.end_byte(),
+            range_start_byte: node.start_byte(),
+            range_end_byte: node.end_byte(),
             is_definition: node.child_by_field_name("body").is_some()
                 || !matches!(
                     node.kind(),
@@ -617,11 +636,97 @@ pub fn resolve_unique<'a>(symbols: &'a [Symbol], query: &str) -> Result<&'a Symb
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn points_are_one_based() {
         assert_eq!(
             SourcePoint::from(Point { row: 4, column: 7 }),
             SourcePoint { line: 5, column: 8 }
         );
+    }
+
+    #[test]
+    fn declaration_range_is_distinct_from_unicode_name_location() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("unicode.rs");
+        let source = "// λ\npub fn naïve(value: usize) -> usize {\n    value + 1\n}\n";
+        std::fs::write(&path, source).unwrap();
+
+        let parsed = parse(&path).unwrap().unwrap();
+        let symbol = parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.leaf_name == "naïve")
+            .unwrap();
+
+        assert_eq!(
+            source.get(symbol.name_start_byte..symbol.name_end_byte),
+            Some("naïve")
+        );
+        let declaration = source
+            .get(symbol.range_start_byte..symbol.range_end_byte)
+            .unwrap();
+        assert!(declaration.starts_with("pub fn naïve"), "{declaration:?}");
+        assert!(declaration.ends_with('}'), "{declaration:?}");
+        assert!(symbol.range_start_byte < symbol.name_start_byte);
+        assert!(symbol.name_end_byte < symbol.range_end_byte);
+        assert_eq!(symbol.start, SourcePoint { line: 2, column: 8 });
+        assert_eq!(
+            lowered_reference("unicode.rs", symbol),
+            "unicode.rs::2:8 naïve"
+        );
+    }
+
+    #[test]
+    fn markdown_ranges_cover_heading_syntax_not_only_the_name() {
+        let source = "  ## Héading ##\nbody\nSetext title\n---\n";
+        let symbols = parse_markdown_headings(source);
+
+        let atx = &symbols[0];
+        assert_eq!(
+            source.get(atx.name_start_byte..atx.name_end_byte),
+            Some("Héading")
+        );
+        assert_eq!(
+            source.get(atx.range_start_byte..atx.range_end_byte),
+            Some("## Héading ##")
+        );
+        assert_eq!(atx.start, SourcePoint { line: 1, column: 6 });
+
+        let setext = &symbols[1];
+        assert_eq!(
+            source.get(setext.name_start_byte..setext.name_end_byte),
+            Some("Setext title")
+        );
+        assert_eq!(
+            source.get(setext.range_start_byte..setext.range_end_byte),
+            Some("Setext title\n---")
+        );
+        assert_eq!(setext.start, SourcePoint { line: 3, column: 1 });
+    }
+
+    #[test]
+    fn supplemented_c_declarations_use_the_source_line_as_the_range() {
+        let source = "  struct Widget; // declaration\n";
+        let mut symbols = Vec::new();
+        assert!(supplement_c_family_declarations(source, &mut symbols));
+        let symbol = &symbols[0];
+
+        assert_eq!(
+            source.get(symbol.name_start_byte..symbol.name_end_byte),
+            Some("Widget")
+        );
+        assert_eq!(
+            source.get(symbol.range_start_byte..symbol.range_end_byte),
+            Some("struct Widget; // declaration")
+        );
+        assert_eq!(
+            symbol.start,
+            SourcePoint {
+                line: 1,
+                column: 10
+            }
+        );
+        assert!(!symbol.is_definition);
     }
 }

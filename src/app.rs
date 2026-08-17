@@ -789,8 +789,10 @@ mod tests {
                 qualified_name: name.into(),
                 kind: "function".into(),
                 start: crate::language::SourcePoint { line: 1, column: 1 },
-                start_byte: 0,
-                end_byte: name.len(),
+                name_start_byte: 0,
+                name_end_byte: name.len(),
+                range_start_byte: 0,
+                range_end_byte: name.len(),
                 is_definition: true,
             },
         };
