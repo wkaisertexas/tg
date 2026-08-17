@@ -240,7 +240,7 @@ impl SymbolProvider {
             launches.fetch_add(1, Ordering::Relaxed);
             let files: Vec<_> = search::walk(&root, SearchMode::Broad)
                 .into_iter()
-                .filter(|path| language::supports(path))
+                .filter(|path| language::may_support_with_source(path))
                 .collect();
             {
                 let mut state = index.lock().unwrap();
@@ -831,6 +831,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider.index_launch_count(), 1);
+    }
+
+    #[test]
+    fn repository_index_lazily_detects_extensionless_shell_scripts() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("deploy"),
+            "#!/usr/bin/env bash\ndeploy_app() { :; }\n",
+        )
+        .unwrap();
+        fs::write(temp.path().join("README"), "plain extensionless text\n").unwrap();
+        let provider = SymbolProvider::with_batch_size(temp.path(), "@", 1).unwrap();
+        assert_eq!(provider.index_launch_count(), 0);
+
+        let mut emissions = Vec::new();
+        provider
+            .query_progressive(
+                request(9, "deploy_app", QueryScope::Repository),
+                &CancellationFlag::default(),
+                &mut |emission| {
+                    emissions.push(emission);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(provider.index_launch_count(), 1);
+        let final_emission = emissions.last().unwrap();
+        assert!(final_emission.completed);
+        assert_eq!(final_emission.progress.unwrap().scanned, 2);
+        assert_eq!(final_emission.progress.unwrap().total, 2);
+        assert!(final_emission.candidates.iter().any(|candidate| {
+            candidate.display.primary == "deploy_app" && candidate.friendly_text.contains("deploy")
+        }));
+        assert!(
+            provider
+                .index
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .all(|entry| entry.relative_path != "README")
+        );
     }
 
     #[test]

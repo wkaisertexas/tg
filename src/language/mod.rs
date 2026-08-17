@@ -128,6 +128,7 @@ pub fn names_equivalent(left: &str, right: &str) -> bool {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Flavor {
+    Bash,
     C,
     CSharp,
     Cpp,
@@ -143,6 +144,20 @@ enum Flavor {
 
 fn grammar(path: &Path) -> Option<(Language, Flavor)> {
     if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        if matches!(
+            name,
+            ".bashrc"
+                | ".bash_profile"
+                | ".bash_login"
+                | ".bash_logout"
+                | ".profile"
+                | "bash.bashrc"
+                | "profile"
+                | "PKGBUILD"
+                | "APKBUILD"
+        ) {
+            return Some((tree_sitter_bash::LANGUAGE.into(), Flavor::Bash));
+        }
         if name == "Jakefile" {
             return Some((tree_sitter_javascript::LANGUAGE.into(), Flavor::JavaScript));
         }
@@ -164,6 +179,7 @@ fn grammar(path: &Path) -> Option<(Language, Flavor)> {
     }
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
+        "sh" | "bash" => Some((tree_sitter_bash::LANGUAGE.into(), Flavor::Bash)),
         "c" => Some((tree_sitter_c::LANGUAGE.into(), Flavor::C)),
         "cs" => Some((tree_sitter_c_sharp::LANGUAGE.into(), Flavor::CSharp)),
         "h" | "hh" | "hpp" | "hxx" | "cc" | "cpp" | "cxx" => {
@@ -186,8 +202,57 @@ fn grammar(path: &Path) -> Option<(Language, Flavor)> {
     }
 }
 
+fn grammar_for_source(path: &Path, source: &str) -> Option<(Language, Flavor)> {
+    grammar(path).or_else(|| {
+        (path.extension().is_none() && has_shell_shebang(source))
+            .then(|| (tree_sitter_bash::LANGUAGE.into(), Flavor::Bash))
+    })
+}
+
+fn has_shell_shebang(source: &str) -> bool {
+    let Some(line) = source
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("#!"))
+    else {
+        return false;
+    };
+    let mut words = line.split_ascii_whitespace();
+    let Some(interpreter) = words.next() else {
+        return false;
+    };
+    let command = if executable_name(interpreter) == Some("env") {
+        match words.next() {
+            Some("-S") => words.next(),
+            Some(word) if !word.starts_with('-') => Some(word),
+            _ => None,
+        }
+    } else {
+        Some(interpreter)
+    };
+
+    command
+        .and_then(executable_name)
+        .is_some_and(|name| matches!(name, "sh" | "bash" | "dash" | "ash"))
+}
+
+fn executable_name(command: &str) -> Option<&str> {
+    Path::new(command).file_name()?.to_str()
+}
+
 pub fn supports(path: &Path) -> bool {
     grammar(path).is_some() || is_markdown(path)
+}
+
+/// Returns whether source contents may identify an otherwise unsupported path.
+/// This path-only prefilter keeps filesystem reads in the background indexer.
+pub(crate) fn may_support_with_source(path: &Path) -> bool {
+    supports(path)
+        || (path.extension().is_none()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.starts_with('.')))
 }
 
 pub fn parse(path: &Path) -> Result<Option<ParsedFile>> {
@@ -218,7 +283,7 @@ fn parse_source_with_parser(
         let symbols = parse_markdown_headings(&source);
         return Ok(Some(ParsedFile { source, symbols }));
     }
-    let Some((language, flavor)) = grammar(path) else {
+    let Some((language, flavor)) = grammar_for_source(path, &source) else {
         return Ok(None);
     };
     if *current_flavor != Some(flavor) {
@@ -229,13 +294,22 @@ fn parse_source_with_parser(
         .parse(&source, None)
         .context("Tree-sitter could not parse the file")?;
     let mut symbols = Vec::new();
-    visit(
-        tree.root_node(),
-        source.as_bytes(),
-        flavor,
-        &mut Vec::new(),
-        &mut symbols,
-    );
+    if flavor == Flavor::Bash {
+        visit_bash(
+            tree.root_node(),
+            source.as_bytes(),
+            &mut Vec::new(),
+            &mut symbols,
+        );
+    } else {
+        visit(
+            tree.root_node(),
+            source.as_bytes(),
+            flavor,
+            &mut Vec::new(),
+            &mut symbols,
+        );
+    }
     symbols.sort_unstable_by_key(|symbol| (symbol.name_start_byte, symbol.name_end_byte));
     if matches!(flavor, Flavor::Cpp | Flavor::C)
         && supplement_c_family_declarations(&source, &mut symbols)
@@ -410,6 +484,83 @@ fn push_markdown_heading(
         is_definition: true,
     });
     hierarchy.push((level, name.to_owned()));
+}
+
+fn visit_bash(
+    node: Node<'_>,
+    source: &[u8],
+    function_scopes: &mut Vec<String>,
+    out: &mut Vec<Symbol>,
+) {
+    let original_scope_len = function_scopes.len();
+
+    if node.kind() == "function_definition"
+        && let Some(name_node) = node.child_by_field_name("name")
+        && name_node.kind() == "word"
+        && let Ok(name) = name_node.utf8_text(source)
+        && !name.is_empty()
+    {
+        let qualified_name = if function_scopes.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{}::{name}", function_scopes.join("::"))
+        };
+        out.push(Symbol {
+            leaf_name: name.to_owned(),
+            qualified_name,
+            kind: "function".to_owned(),
+            start: name_node.start_position().into(),
+            name_start_byte: name_node.start_byte(),
+            name_end_byte: name_node.end_byte(),
+            range_start_byte: node.start_byte(),
+            range_end_byte: node.end_byte(),
+            is_definition: true,
+        });
+        function_scopes.push(name.to_owned());
+    } else if function_scopes.is_empty()
+        && node.kind() == "variable_assignment"
+        && let Some(name_node) = node.child_by_field_name("name")
+        && name_node.kind() == "variable_name"
+        && is_top_level_shell_assignment(node)
+        && let Ok(name) = name_node.utf8_text(source)
+        && !name.is_empty()
+    {
+        let declaration = shell_assignment_declaration(node);
+        out.push(Symbol {
+            leaf_name: name.to_owned(),
+            qualified_name: name.to_owned(),
+            kind: "variable".to_owned(),
+            start: name_node.start_position().into(),
+            name_start_byte: name_node.start_byte(),
+            name_end_byte: name_node.end_byte(),
+            range_start_byte: declaration.start_byte(),
+            range_end_byte: declaration.end_byte(),
+            is_definition: true,
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        visit_bash(child, source, function_scopes, out);
+    }
+    function_scopes.truncate(original_scope_len);
+}
+
+fn is_top_level_shell_assignment(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "program"
+        || (parent.kind() == "declaration_command"
+            && parent
+                .parent()
+                .is_some_and(|grandparent| grandparent.kind() == "program"))
+}
+
+fn shell_assignment_declaration(node: Node<'_>) -> Node<'_> {
+    node.parent()
+        .filter(|parent| parent.kind() == "declaration_command")
+        .unwrap_or(node)
 }
 
 fn classification(
