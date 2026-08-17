@@ -2,6 +2,7 @@ pub mod app;
 pub mod clipboard;
 pub mod composer;
 pub mod config;
+pub mod editor;
 pub mod language;
 pub mod preview;
 pub mod references;
