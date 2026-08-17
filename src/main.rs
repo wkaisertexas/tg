@@ -46,8 +46,12 @@ fn real_main() -> Result<()> {
         tscodeselection::config::load(&config_inputs).context("could not load configuration")?;
 
     if let Some(prompt) = cli.resolve {
-        let lowered = tscodeselection::composer::resolve_prompt(&repository.search_root, &prompt)
-            .context("could not resolve prompt")?;
+        let lowered = tscodeselection::composer::resolve_prompt_with_config(
+            &repository,
+            &loaded_config.config,
+            &prompt,
+        )
+        .context("could not resolve prompt")?;
         println!("{lowered}");
         return Ok(());
     }

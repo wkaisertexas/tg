@@ -26,7 +26,7 @@ fn unresolved_and_unsupported_references_do_not_modify_the_source_prompt() {
 }
 
 #[test]
-fn token_boundaries_and_escaped_looking_text_match_v01_behavior() {
+fn token_boundaries_and_escaped_leaders_follow_the_current_lowering_contract() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("notes.txt"), "notes\n").unwrap();
 
@@ -36,6 +36,6 @@ fn token_boundaries_and_escaped_looking_text_match_v01_behavior() {
             "email@example.com (@notes.txt), x@notes.txt and \\@notes.txt",
         )
         .unwrap(),
-        "email@example.com (notes.txt), x@notes.txt and \\@notes.txt"
+        "email@example.com (notes.txt), x@notes.txt and @notes.txt"
     );
 }

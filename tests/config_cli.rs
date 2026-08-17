@@ -237,3 +237,54 @@ fn tokenizer_cli_override_is_validated_after_files() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("tokens.tokenizer"));
 }
+
+#[test]
+fn headless_resolution_uses_loaded_custom_leaders() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let root = temp.path().join("root");
+    fs::create_dir(&home).unwrap();
+    create_root(&root);
+    let config = temp.path().join("custom.toml");
+    fs::write(&config, "[leaders]\nfiles='@@'\n").unwrap();
+
+    let output = command(&home)
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--resolve",
+            "Read @@selected.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"Read selected.txt\n");
+}
+
+#[test]
+fn late_headless_failure_emits_no_partial_stdout() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let root = temp.path().join("root");
+    fs::create_dir(&home).unwrap();
+    create_root(&root);
+
+    let output = command(&home)
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--resolve",
+            "Read @selected.txt then @missing.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no exact file reference"));
+}
