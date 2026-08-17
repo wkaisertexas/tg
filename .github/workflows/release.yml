@@ -32,6 +32,8 @@ jobs:
         env:
           TG_REPOSITORY: ${{ github.repository }}
         run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Smoke-test release binary
+        run: python3 tests/release_smoke_test.py "target/${{ matrix.target }}/release/tg"
       - name: Prepare verified asset
         shell: bash
         run: |
