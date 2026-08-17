@@ -130,11 +130,17 @@ pub fn names_equivalent(left: &str, right: &str) -> bool {
 enum Flavor {
     C,
     Cpp,
+    JavaScript,
     Rust,
     Python,
+    TypeScript,
+    Tsx,
 }
 
 fn grammar(path: &Path) -> Option<(Language, Flavor)> {
+    if path.file_name().and_then(|name| name.to_str()) == Some("Jakefile") {
+        return Some((tree_sitter_javascript::LANGUAGE.into(), Flavor::JavaScript));
+    }
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
         "c" => Some((tree_sitter_c::LANGUAGE.into(), Flavor::C)),
@@ -143,6 +149,14 @@ fn grammar(path: &Path) -> Option<(Language, Flavor)> {
         }
         "rs" => Some((tree_sitter_rust::LANGUAGE.into(), Flavor::Rust)),
         "py" | "pyi" => Some((tree_sitter_python::LANGUAGE.into(), Flavor::Python)),
+        "js" | "mjs" | "cjs" | "jsx" => {
+            Some((tree_sitter_javascript::LANGUAGE.into(), Flavor::JavaScript))
+        }
+        "ts" | "mts" | "cts" => Some((
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Flavor::TypeScript,
+        )),
+        "tsx" => Some((tree_sitter_typescript::LANGUAGE_TSX.into(), Flavor::Tsx)),
         _ => None,
     }
 }
@@ -374,30 +388,81 @@ fn push_markdown_heading(
 }
 
 fn classification(
-    kind: &str,
+    node: Node<'_>,
     flavor: Flavor,
     inside_type: bool,
 ) -> Option<(&'static str, &'static str)> {
+    let kind = node.kind();
+    let is_ecmascript = matches!(
+        flavor,
+        Flavor::JavaScript | Flavor::TypeScript | Flavor::Tsx
+    );
+    let is_typescript = matches!(flavor, Flavor::TypeScript | Flavor::Tsx);
     let result = match kind {
         "namespace_definition" | "mod_item" => ("module", "name"),
+        "internal_module" | "module" if is_typescript => ("module", "name"),
         "class_definition" => ("class", "name"),
+        "class_declaration" if is_ecmascript => ("class", "name"),
+        "class" if is_ecmascript && node.child_by_field_name("name").is_some() => ("class", "name"),
+        "abstract_class_declaration" if is_typescript => ("class", "name"),
+        "interface_declaration" if is_typescript => ("interface", "name"),
         "class_specifier" => ("class", "name"),
         "struct_specifier" | "struct_item" => ("struct", "name"),
         "union_specifier" | "union_item" => ("union", "name"),
         "enum_specifier" | "enum_item" => ("enum", "name"),
+        "enum_declaration" if is_typescript => ("enum", "name"),
         "trait_item" => ("trait", "name"),
         "type_item" | "type_definition" | "alias_declaration" => ("type alias", "name"),
+        "type_alias_declaration" if is_typescript => ("type alias", "name"),
         "function_item" | "function_definition" => {
             (if inside_type { "method" } else { "function" }, "name")
         }
+        "function_declaration" | "generator_function_declaration" if is_ecmascript => {
+            (if inside_type { "method" } else { "function" }, "name")
+        }
+        "function_expression" | "generator_function"
+            if is_ecmascript && node.child_by_field_name("name").is_some() =>
+        {
+            (if inside_type { "method" } else { "function" }, "name")
+        }
+        "function_signature" if is_typescript => {
+            (if inside_type { "method" } else { "function" }, "name")
+        }
+        "method_definition" if is_ecmascript => ("method", "name"),
+        "method_signature" | "abstract_method_signature" if is_typescript => ("method", "name"),
         "enumerator" | "enum_variant" => ("enum member", "name"),
+        "enum_assignment" if is_typescript => ("enum member", "name"),
+        "property_identifier"
+            if is_typescript
+                && node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "enum_body") =>
+        {
+            ("enum member", "name")
+        }
         "field_declaration" => ("field", "declarator"),
+        "field_definition" if is_ecmascript => ("field", "property"),
+        "public_field_definition" | "property_signature" if is_typescript => ("field", "name"),
+        "variable_declarator" if is_ecmascript && is_callable_variable(node) => {
+            ("function", "name")
+        }
         _ => return None,
     };
     if matches!(flavor, Flavor::Python) && kind == "function_definition" {
         return Some((if inside_type { "method" } else { "function" }, "name"));
     }
     Some(result)
+}
+
+fn is_callable_variable(node: Node<'_>) -> bool {
+    node.child_by_field_name("value").is_some_and(|value| {
+        matches!(
+            value.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        )
+    }) && node
+        .child_by_field_name("name")
+        .is_some_and(|name| name.kind() == "identifier")
 }
 
 fn supplement_c_family_declarations(source: &str, symbols: &mut Vec<Symbol>) -> bool {
@@ -455,31 +520,47 @@ fn supplement_c_family_declarations(source: &str, symbols: &mut Vec<Symbol>) -> 
     !added_offsets.is_empty()
 }
 
-fn is_scope(kind: &str) -> bool {
-    matches!(
-        kind,
-        "namespace_definition"
-            | "class_definition"
-            | "class_specifier"
-            | "struct_specifier"
-            | "struct_item"
-            | "union_specifier"
-            | "union_item"
-            | "enum_specifier"
-            | "enum_item"
-            | "trait_item"
-            | "mod_item"
-    )
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    Module,
+    Type,
+}
+
+struct Scope {
+    name: String,
+    kind: ScopeKind,
+}
+
+fn scope_kind(kind: &str) -> Option<ScopeKind> {
+    match kind {
+        "namespace_definition" | "mod_item" | "internal_module" | "module" => {
+            Some(ScopeKind::Module)
+        }
+        "class_definition"
+        | "class_specifier"
+        | "class"
+        | "class_declaration"
+        | "abstract_class_declaration"
+        | "interface_declaration"
+        | "struct_specifier"
+        | "struct_item"
+        | "union_specifier"
+        | "union_item"
+        | "enum_specifier"
+        | "enum_item"
+        | "enum_declaration"
+        | "trait_item" => Some(ScopeKind::Type),
+        _ => None,
+    }
 }
 
 fn identifier<'a>(node: Node<'a>, preferred: &str) -> Option<Node<'a>> {
     let direct = node
         .child_by_field_name(preferred)
         .or_else(|| node.child_by_field_name("name"));
-    direct.and_then(unwrap_identifier).or_else(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).find_map(unwrap_identifier)
-    })
+    direct
+        .and_then(unwrap_identifier)
+        .or_else(|| unwrap_identifier(node))
 }
 
 fn unwrap_identifier(node: Node<'_>) -> Option<Node<'_>> {
@@ -488,6 +569,8 @@ fn unwrap_identifier(node: Node<'_>) -> Option<Node<'_>> {
         "identifier"
             | "type_identifier"
             | "field_identifier"
+            | "property_identifier"
+            | "private_property_identifier"
             | "namespace_identifier"
             | "constant"
             | "operator_name"
@@ -502,26 +585,36 @@ fn visit(
     node: Node<'_>,
     source: &[u8],
     flavor: Flavor,
-    scopes: &mut Vec<String>,
+    scopes: &mut Vec<Scope>,
     out: &mut Vec<Symbol>,
 ) {
-    let inside_type = !scopes.is_empty();
+    let inside_type = scopes
+        .last()
+        .is_some_and(|scope| scope.kind == ScopeKind::Type);
     let original_scope_len = scopes.len();
     if node.kind() == "impl_item"
         && let Some(type_node) = node.child_by_field_name("type").and_then(unwrap_identifier)
         && let Ok(name) = type_node.utf8_text(source)
     {
-        scopes.push(name.to_owned());
+        scopes.push(Scope {
+            name: name.to_owned(),
+            kind: ScopeKind::Type,
+        });
     }
-    if let Some((symbol_kind, field)) = classification(node.kind(), flavor, inside_type)
+    if let Some((symbol_kind, field)) = classification(node, flavor, inside_type)
         && let Some(name_node) = identifier(node, field)
         && let Ok(name) = name_node.utf8_text(source)
         && !name.is_empty()
+        && !(node.kind() == "method_definition" && name == "constructor")
     {
         let qualified_name = if scopes.is_empty() {
             name.to_owned()
         } else {
-            let mut qualified = scopes.join("::");
+            let mut qualified = scopes
+                .iter()
+                .map(|scope| scope.name.as_str())
+                .collect::<Vec<_>>()
+                .join("::");
             qualified.push_str("::");
             qualified.push_str(name);
             qualified
@@ -535,17 +628,16 @@ fn visit(
             name_end_byte: name_node.end_byte(),
             range_start_byte: node.start_byte(),
             range_end_byte: node.end_byte(),
-            is_definition: node.child_by_field_name("body").is_some()
-                || !matches!(
-                    node.kind(),
-                    "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
-                ),
+            is_definition: is_definition(node),
         });
-        if is_scope(node.kind()) {
-            scopes.push(name.to_owned());
+        if let Some(kind) = scope_kind(node.kind()) {
+            scopes.push(Scope {
+                name: name.to_owned(),
+                kind,
+            });
         }
     }
-    if matches!(node.kind(), "function_definition" | "function_item") {
+    if is_callable(node) {
         scopes.truncate(original_scope_len);
         return;
     }
@@ -554,6 +646,40 @@ fn visit(
         visit(child, source, flavor, scopes, out);
     }
     scopes.truncate(original_scope_len);
+}
+
+fn is_callable(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_definition"
+            | "function_item"
+            | "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "function_signature"
+            | "method_definition"
+            | "method_signature"
+            | "abstract_method_signature"
+    ) || (node.kind() == "variable_declarator" && is_callable_variable(node))
+}
+
+fn is_definition(node: Node<'_>) -> bool {
+    match node.kind() {
+        "class_specifier"
+        | "struct_specifier"
+        | "union_specifier"
+        | "enum_specifier"
+        | "function_signature"
+        | "method_signature"
+        | "abstract_method_signature"
+        | "property_signature" => false,
+        "function_declaration" | "generator_function_declaration" | "method_definition" => {
+            node.child_by_field_name("body").is_some()
+        }
+        _ => true,
+    }
 }
 
 pub fn find_symbols<'a>(symbols: &'a [Symbol], query: &str) -> Vec<&'a Symbol> {
