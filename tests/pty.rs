@@ -17,6 +17,19 @@ fn terminal_binary_accepts_a_prompt_and_restores_the_screen() {
     command.arg(temp.path());
     command.cwd(temp.path());
     command.env("TERM", "xterm-256color");
+    command.env("HOME", temp.path());
+    for name in [
+        "XDG_CONFIG_HOME",
+        "TG_CONFIG",
+        "TG_ROOT",
+        "TG_TOKENIZER",
+        "TG_GH_COMMAND",
+        "TG_JIRA_COMMAND",
+        "TG_NO_PROJECT_CONFIG",
+        "NO_COLOR",
+    ] {
+        command.env_remove(name);
+    }
     let mut child = pair.slave.spawn_command(command).unwrap();
     drop(pair.slave);
 

@@ -40,8 +40,11 @@ fn every_documented_invocation_resolves_end_to_end() {
     let document: Document =
         serde_yaml::from_str(include_str!("../examples/invocations.yaml")).unwrap();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let home = tempfile::tempdir().unwrap();
     for case in document.cases {
-        let output = Command::new(env!("CARGO_BIN_EXE_tg"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tg"));
+        isolate_config(&mut command, home.path());
+        let output = command
             .current_dir(root)
             .args([".", "--resolve", &case.submitted_prompt])
             .output()
@@ -89,5 +92,21 @@ fn every_documented_invocation_resolves_end_to_end() {
                 .iter()
                 .any(|(line, _)| *line == case.expected.preview.focus_line)
         );
+    }
+}
+
+fn isolate_config(command: &mut Command, home: &std::path::Path) {
+    command.env("HOME", home);
+    for name in [
+        "XDG_CONFIG_HOME",
+        "TG_CONFIG",
+        "TG_ROOT",
+        "TG_TOKENIZER",
+        "TG_GH_COMMAND",
+        "TG_JIRA_COMMAND",
+        "TG_NO_PROJECT_CONFIG",
+        "NO_COLOR",
+    ] {
+        command.env_remove(name);
     }
 }
