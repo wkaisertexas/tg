@@ -1,5 +1,5 @@
 {
-  description = "Symbol-aware file selector written in Rust";
+  description = "Vim-like coding-agent prompt editor written in Rust";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
@@ -26,8 +26,8 @@
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
-            # Integration fixtures are intentionally Git-ignored; run `just check` locally.
-            doCheck = false;
+            doCheck = true;
+            meta.mainProgram = "tg";
           };
         }
       );

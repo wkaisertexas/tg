@@ -2,11 +2,14 @@ set dotenv-load := true
 
 default: run
 
-run root=".":
-    cargo run --release -- "{{root}}"
+run:
+    cargo run --release --
+
+edit file root=".":
+    cargo run --release -- --root "{{root}}" "{{file}}"
 
 resolve prompt root=".":
-    cargo run --release -- "{{root}}" --resolve "{{prompt}}"
+    cargo run --release -- --root "{{root}}" --resolve "{{prompt}}"
 
 build:
     cargo build --release

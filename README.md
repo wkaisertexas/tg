@@ -1,21 +1,22 @@
 # tg
 
-A Rust terminal composer for fuzzy file references and syntax-aware symbol selection.
-`@` respects Git ignores; `%` searches ignored files too. C, C++, Rust, Python, and Markdown
-code lowers to `path::line:column Name`; Markdown lowers to compact `path.md#heading` anchors.
+A focused Vim-like terminal editor for composing coding-agent prompts with
+structured references. `@` searches Git-visible files, `%` includes ignored
+files, `::` searches symbols, and `$` searches local skills. Accepted references
+remain readable while editing and lower to durable agent-readable text on save.
 
-The next version is being designed as a focused Vim-like prompt editor that can
-be used through `VISUAL`/`EDITOR` or as `tg FILE`. See
+`tg` can edit an ordinary UTF-8 file directly or act as `VISUAL`/`EDITOR`. See
 [`docs/spec.md`](docs/spec.md), [`docs/editor-design.md`](docs/editor-design.md),
 [`docs/reference-providers.md`](docs/reference-providers.md), and
 [`docs/configuration-ui.md`](docs/configuration-ui.md).
 
-## Scaffold
+## Structure
 
-- `src/app.rs` — Ratatui REPL, input handling, results, and source preview
+- `src/app.rs`, `src/editor/` — minimal full-screen editor and Vim adapter
+- `src/references/` — file, symbol, skill, GitHub, and Jira providers
 - `src/search/` — Git-aware/broad walking and fuzzy path ranking
 - `src/language/` — Tree-sitter parsing, extraction, and symbol ranking
-- `src/composer/`, `repository.rs`, `preview.rs` — lowering, roots, and previews
+- `src/composer/`, `repository.rs`, `preview.rs` — headless lowering, roots, and previews
 - `tests/` — extraction, search, and YAML-driven end-to-end coverage
 
 ## Build and verify
@@ -27,11 +28,16 @@ just check
 ```sh
 curl -fsSL https://raw.githubusercontent.com/wkaisertexas/tg/main/install.sh | sh
 tg README.md
-tg --root .
-cargo run --release --bin tg -- [file]
+tg --root . prompts/task.md
+VISUAL=tg EDITOR=tg codex
+cargo run --release --bin tg -- [FILE]
 ```
 
-Type `@`/`%` for files or standalone `::` for repository symbols; append `.` for members.
-`Tab` or Enter. Enter submits when completion is closed; `Ctrl-J` always submits. `Esc`
-dismisses; `Ctrl-C` cancels/clears/exits; `Ctrl-D` exits empty. For automation, add
-`--resolve 'Inspect @src/lib.rs::Symbol'` with `--root` when needed. Upgrade with `tg update`.
+The old `tg .` selector form is gone: directories are not editable files. Use
+`tg FILE`, or combine an explicit search root and file with `tg --root DIR FILE`.
+
+The editor supports normal, insert, visual, and visual-block modes; common Vim
+motions/operators; search; undo/redo; registers; and exact `:w`, `:q`, `:q!`,
+`:wq`, and `:copy` commands. Use `Tab` or Enter to accept an active completion,
+`Esc` to dismiss it, and `Ctrl-P` to toggle its preview. For scripts, use
+`tg --root DIR --resolve 'Inspect @src/lib.rs::Symbol'`. Upgrade with `tg update`.
