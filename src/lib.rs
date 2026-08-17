@@ -4,6 +4,7 @@ pub mod composer;
 pub mod config;
 pub mod language;
 pub mod preview;
+pub mod references;
 pub mod repository;
 pub mod search;
 pub mod updater;
