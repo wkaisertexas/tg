@@ -1,4 +1,5 @@
 pub mod app;
+pub mod clipboard;
 pub mod composer;
 pub mod language;
 pub mod preview;

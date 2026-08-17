@@ -2,7 +2,6 @@ use crate::language::{self, ParsedFile, Symbol};
 use crate::repository::Repository;
 use crate::search::{self, FileMatch, SearchMode};
 use anyhow::Result;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -726,7 +725,11 @@ pub fn run(repo: Repository) -> Result<()> {
             {
                 let should_exit = app.key(key);
                 if let Some(text) = app.pending_clipboard.take() {
-                    write!(terminal.backend_mut(), "{}", osc52_sequence(&text))?;
+                    write!(
+                        terminal.backend_mut(),
+                        "{}",
+                        crate::clipboard::osc52_sequence(&text)
+                    )?;
                     terminal.backend_mut().flush()?;
                 }
                 if should_exit {
@@ -757,10 +760,6 @@ fn is_completion_accept_key(code: KeyCode) -> bool {
 
 fn centered_preview_scroll(one_based_line: usize) -> usize {
     one_based_line.saturating_sub(6)
-}
-
-fn osc52_sequence(text: &str) -> String {
-    format!("\u{1b}]52;c;{}\u{7}", BASE64.encode(text))
 }
 
 #[cfg(test)]
@@ -803,8 +802,53 @@ mod tests {
     #[test]
     fn osc52_encodes_the_lowered_prompt() {
         assert_eq!(
-            osc52_sequence("src/lib.rs"),
+            crate::clipboard::osc52_sequence("src/lib.rs"),
             "\u{1b}]52;c;c3JjL2xpYi5ycw==\u{7}"
         );
+    }
+
+    #[test]
+    fn accepted_references_lower_independently_of_rendering() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("notes.txt");
+        std::fs::write(&path, "notes\n").unwrap();
+        let repo = Repository::discover(temp.path()).unwrap();
+        let mut app = App::new(repo);
+        app.text = "Read @notes.txt, then continue.".into();
+        app.resolutions.push(ResolvedSpan {
+            start: 5,
+            end: 15,
+            lowered: "notes.txt".into(),
+            path,
+        });
+
+        assert_eq!(
+            app.lower_resolved().unwrap(),
+            "Read notes.txt, then continue."
+        );
+        assert_eq!(app.text, "Read @notes.txt, then continue.");
+    }
+
+    #[test]
+    fn deleted_reference_targets_are_stale_without_losing_prompt_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("notes.txt");
+        std::fs::write(&path, "notes\n").unwrap();
+        let repo = Repository::discover(temp.path()).unwrap();
+        let mut app = App::new(repo);
+        app.text = "@notes.txt".into();
+        app.resolutions.push(ResolvedSpan {
+            start: 0,
+            end: app.text.len(),
+            lowered: "notes.txt".into(),
+            path: path.clone(),
+        });
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(
+            app.lower_resolved().unwrap_err().to_string(),
+            "selected file no longer exists"
+        );
+        assert_eq!(app.text, "@notes.txt");
     }
 }

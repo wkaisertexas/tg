@@ -30,6 +30,7 @@ tree-sitter-rust = "0.24"
 
 [dev-dependencies]
 assert_cmd = "2"
+portable-pty = "0.9"
 serde_yaml = "0.9"
 tempfile = "3"
 criterion = "0.7"
