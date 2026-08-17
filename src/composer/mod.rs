@@ -126,19 +126,21 @@ fn providers_for(
     if kinds.contains(&ReferenceKind::BroadFile) {
         providers.insert(
             ReferenceKind::BroadFile,
-            Box::new(FileProvider::new(
+            Box::new(FileProvider::with_broad_excludes(
                 &repository.search_root,
                 ReferenceKind::BroadFile,
                 &config.leaders.broad_files,
+                &config.search.broad_excludes,
             )?),
         );
     }
     if kinds.contains(&ReferenceKind::Symbol) {
         providers.insert(
             ReferenceKind::Symbol,
-            Box::new(SymbolProvider::new(
+            Box::new(SymbolProvider::with_broad_excludes(
                 &repository.search_root,
                 &config.leaders.files,
+                &config.search.broad_excludes,
             )?),
         );
     }

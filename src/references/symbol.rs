@@ -59,14 +59,28 @@ pub struct SymbolProvider {
     targets: Mutex<HashMap<String, SymbolTarget>>,
     index_launches: Arc<AtomicUsize>,
     parse_count: AtomicUsize,
+    broad_excludes: Vec<String>,
 }
 
 impl SymbolProvider {
     pub fn new(root: &Path, leader: impl Into<String>) -> Result<Self> {
-        Self::with_batch_size(root, leader, 64)
+        Self::with_broad_excludes(root, leader, &[])
     }
 
-    fn with_batch_size(root: &Path, leader: impl Into<String>, batch_size: usize) -> Result<Self> {
+    pub fn with_broad_excludes(
+        root: &Path,
+        leader: impl Into<String>,
+        broad_excludes: &[String],
+    ) -> Result<Self> {
+        Self::with_batch_size(root, leader, 64, broad_excludes)
+    }
+
+    fn with_batch_size(
+        root: &Path,
+        leader: impl Into<String>,
+        batch_size: usize,
+        broad_excludes: &[String],
+    ) -> Result<Self> {
         let canonical_root = root
             .canonicalize()
             .with_context(|| format!("cannot read search root {}", root.display()))?;
@@ -80,6 +94,7 @@ impl SymbolProvider {
             targets: Mutex::new(HashMap::new()),
             index_launches: Arc::new(AtomicUsize::new(0)),
             parse_count: AtomicUsize::new(0),
+            broad_excludes: broad_excludes.to_vec(),
         })
     }
 
@@ -236,12 +251,14 @@ impl SymbolProvider {
         let index = Arc::clone(&self.index);
         let launches = Arc::clone(&self.index_launches);
         let batch_size = self.batch_size;
+        let broad_excludes = self.broad_excludes.clone();
         std::thread::spawn(move || {
             launches.fetch_add(1, Ordering::Relaxed);
-            let files: Vec<_> = search::walk(&root, SearchMode::Broad)
-                .into_iter()
-                .filter(|path| language::may_support_with_source(path))
-                .collect();
+            let files: Vec<_> =
+                search::walk_with_excludes(&root, SearchMode::Broad, &broad_excludes)
+                    .into_iter()
+                    .filter(|path| language::may_support_with_source(path))
+                    .collect();
             {
                 let mut state = index.lock().unwrap();
                 state.total = files.len();
@@ -763,7 +780,7 @@ mod tests {
         fs::write(temp.path().join(".gitignore"), "ignored.rs\n").unwrap();
         fs::write(temp.path().join("visible.rs"), "struct Visible;\n").unwrap();
         fs::write(temp.path().join("ignored.rs"), "struct Ignored;\n").unwrap();
-        let provider = SymbolProvider::with_batch_size(temp.path(), "@", 1).unwrap();
+        let provider = SymbolProvider::with_batch_size(temp.path(), "@", 1, &[]).unwrap();
         assert_eq!(provider.index_launch_count(), 0);
 
         let mut emissions = Vec::new();
@@ -842,7 +859,7 @@ mod tests {
         )
         .unwrap();
         fs::write(temp.path().join("README"), "plain extensionless text\n").unwrap();
-        let provider = SymbolProvider::with_batch_size(temp.path(), "@", 1).unwrap();
+        let provider = SymbolProvider::with_batch_size(temp.path(), "@", 1, &[]).unwrap();
         assert_eq!(provider.index_launch_count(), 0);
 
         let mut emissions = Vec::new();

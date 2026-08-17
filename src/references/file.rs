@@ -23,6 +23,15 @@ pub struct FileProvider {
 
 impl FileProvider {
     pub fn new(root: &Path, kind: ReferenceKind, leader: impl Into<String>) -> Result<Self> {
+        Self::with_broad_excludes(root, kind, leader, &[])
+    }
+
+    pub fn with_broad_excludes(
+        root: &Path,
+        kind: ReferenceKind,
+        leader: impl Into<String>,
+        broad_excludes: &[String],
+    ) -> Result<Self> {
         let (mode, origin) = match kind {
             ReferenceKind::GitFile => (SearchMode::GitAware, FileOrigin::GitAware),
             ReferenceKind::BroadFile => (SearchMode::Broad, FileOrigin::Broad),
@@ -31,7 +40,7 @@ impl FileProvider {
         let canonical_root = root
             .canonicalize()
             .with_context(|| format!("cannot read search root {}", root.display()))?;
-        let files = search::walk(root, mode);
+        let files = search::walk_with_excludes(root, mode, broad_excludes);
         Ok(Self {
             root: root.to_path_buf(),
             canonical_root,

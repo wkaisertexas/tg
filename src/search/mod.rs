@@ -1,7 +1,6 @@
 use anyhow::Result;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use ignore::WalkBuilder;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +18,16 @@ pub struct FileMatch {
 }
 
 pub fn walk(root: &Path, mode: SearchMode) -> Vec<PathBuf> {
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    walk_with_excludes(root, mode, &[])
+}
+
+pub fn walk_with_excludes(
+    root: &Path,
+    mode: SearchMode,
+    broad_excludes: &[String],
+) -> Vec<PathBuf> {
+    let filter_root = root.to_path_buf();
+    let filter_excludes = broad_excludes.to_vec();
     let mut builder = WalkBuilder::new(root);
     builder.hidden(false).follow_links(false);
     if mode == SearchMode::Broad {
@@ -29,18 +37,38 @@ pub fn walk(root: &Path, mode: SearchMode) -> Vec<PathBuf> {
             .ignore(false)
             .parents(false);
     }
-    let mut seen = HashSet::new();
     builder
-        .filter_entry(|entry| entry.file_name() != ".git")
+        .filter_entry(move |entry| {
+            entry.file_name() != ".git"
+                && (mode != SearchMode::Broad
+                    || !is_broadly_excluded(&filter_root, entry.path(), &filter_excludes))
+        })
         .build()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-        .filter_map(|entry| {
-            let path = entry.into_path();
-            let canonical = path.canonicalize().ok()?;
-            (canonical.starts_with(&canonical_root) && seen.insert(canonical)).then_some(path)
-        })
+        // Links are not followed and symlink entries are not regular files, so
+        // containment and cycle safety do not require canonicalizing every hit.
+        // Exact resolution still canonicalizes and verifies its target.
+        .map(|entry| entry.into_path())
         .collect()
+}
+
+fn is_broadly_excluded(root: &Path, path: &Path, excludes: &[String]) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    excludes.iter().any(|exclude| {
+        let exclude = exclude.trim_matches('/').trim_start_matches("./");
+        if exclude.is_empty() {
+            return false;
+        }
+        if exclude.contains('/') {
+            relative == exclude || relative.starts_with(&format!("{exclude}/"))
+        } else {
+            relative.split('/').any(|component| component == exclude)
+        }
+    })
 }
 
 pub fn find(root: &Path, files: &[PathBuf], query: &str, limit: usize) -> Vec<FileMatch> {

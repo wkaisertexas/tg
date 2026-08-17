@@ -76,12 +76,17 @@ impl App {
             ReferenceKind::GitFile,
             config.leaders.files.clone(),
         )?;
-        let broad = FileProvider::new(
+        let broad = FileProvider::with_broad_excludes(
             &repo.search_root,
             ReferenceKind::BroadFile,
             config.leaders.broad_files.clone(),
+            &config.search.broad_excludes,
         )?;
-        let symbols = SymbolProvider::new(&repo.search_root, config.leaders.files.clone())?;
+        let symbols = SymbolProvider::with_broad_excludes(
+            &repo.search_root,
+            config.leaders.files.clone(),
+            &config.search.broad_excludes,
+        )?;
         let skills = SkillProvider::new(
             &repo.search_root,
             &repo.invocation_root,
