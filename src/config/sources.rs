@@ -190,13 +190,24 @@ pub fn load(inputs: &ConfigInputs) -> Result<LoadedConfig, ConfigLoadError> {
     }
 
     config.normalize_and_validate().map_err(|error| {
-        let origin: Option<&LoadedSource> = provenance.get(&error.path);
+        let mut key = error.path.clone();
+        let mut origin: Option<&LoadedSource> = provenance.get(&key);
+        if origin.is_none()
+            && key.starts_with("leaders.")
+            && let Some((configured_key, configured_origin)) = provenance
+                .iter()
+                .filter(|(candidate, _)| candidate.starts_with("leaders."))
+                .max_by_key(|(_, source)| source_precedence(source.kind))
+        {
+            key.clone_from(configured_key);
+            origin = Some(configured_origin);
+        }
         ConfigLoadError::new(
             origin.map(|source| source.kind),
             origin.and_then(|source| source.path.clone()),
             error.message.clone(),
         )
-        .key(error.path)
+        .key(key)
     })?;
     Ok(LoadedConfig { config, sources })
 }
@@ -435,6 +446,24 @@ fn validate_project_fields(
     let Some(root) = value.as_table() else {
         return Ok(());
     };
+    for key in root.keys() {
+        if !matches!(
+            key.as_str(),
+            "version" | "ui" | "leaders" | "search" | "tokens" | "skills" | "providers"
+        ) {
+            return Err(forbidden(config_path, key.clone()));
+        }
+    }
+    if let Some(ui) = root.get("ui").and_then(toml::Value::as_table)
+        && ui.contains_key("preview_toggle")
+    {
+        return Err(forbidden(config_path, "ui.preview_toggle".into()));
+    }
+    if let Some(tokens) = root.get("tokens").and_then(toml::Value::as_table)
+        && let Some(key) = tokens.keys().find(|key| key.as_str() != "tokenizer")
+    {
+        return Err(forbidden(config_path, format!("tokens.{key}")));
+    }
     if let Some(skills) = root.get("skills").and_then(toml::Value::as_table) {
         for key in skills.keys() {
             if key != "roots" {
@@ -482,9 +511,9 @@ fn validate_project_fields(
         for (provider_name, provider) in providers {
             if let Some(table) = provider.as_table() {
                 let allowed: &[&str] = if provider_name == "jira" {
-                    &["enabled", "key_prefix", "limit", "timeout_ms"]
+                    &["key_prefix"]
                 } else {
-                    &["enabled", "limit", "timeout_ms"]
+                    &[]
                 };
                 if let Some(key) = table.keys().find(|key| !allowed.contains(&key.as_str())) {
                     return Err(forbidden(
@@ -521,18 +550,31 @@ fn validate_project_root(path: &str, repository_root: &Path) -> Result<(), Strin
         return Err("must be a relative path contained in the repository".into());
     }
     let candidate = repository_root.join(path);
-    if candidate.exists() {
-        let canonical_root = repository_root
-            .canonicalize()
-            .map_err(|error| format!("cannot resolve repository root: {error}"))?;
-        let canonical_candidate = candidate
-            .canonicalize()
-            .map_err(|error| format!("cannot resolve skill root: {error}"))?;
-        if !canonical_candidate.starts_with(canonical_root) {
-            return Err("resolves outside the repository".into());
-        }
+    let canonical_root = repository_root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve repository root: {error}"))?;
+    let mut existing = candidate.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| "cannot resolve a containing directory".to_owned())?;
+    }
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve skill-root ancestor: {error}"))?;
+    if !canonical_existing.starts_with(canonical_root) {
+        return Err("resolves outside the repository".into());
     }
     Ok(())
+}
+
+fn source_precedence(kind: SourceKind) -> u8 {
+    match kind {
+        SourceKind::User => 1,
+        SourceKind::Project => 2,
+        SourceKind::Environment => 3,
+        SourceKind::Cli => 4,
+    }
 }
 
 fn resolve_trusted_skill_roots(
@@ -794,6 +836,57 @@ mod tests {
             "[[skills.roots]]\npath = \"linked\"\n",
         );
         assert!(load(&inputs).unwrap_err().to_string().contains("outside"));
+
+        write(
+            &repo.join(".tg.toml"),
+            "[[skills.roots]]\npath = \"linked/not-created-yet\"\n",
+        );
+        assert!(load(&inputs).unwrap_err().to_string().contains("outside"));
+    }
+
+    #[test]
+    fn project_uses_an_explicit_safe_leaf_allowlist() {
+        let temp = tempfile::tempdir().unwrap();
+        let inputs = inputs(&temp);
+        let project = inputs.repository_root.as_ref().unwrap().join(".tg.toml");
+
+        for (text, key) in [
+            ("[editor]\ncopy_command=':evil'\n", "editor"),
+            ("[ui]\npreview_toggle='ctrl-x'\n", "ui.preview_toggle"),
+            ("[tokens]\ndecimals=2\n", "tokens.decimals"),
+            (
+                "[providers.github]\nenabled=false\n",
+                "providers.github.enabled",
+            ),
+            ("[providers.jira]\nlimit=2\n", "providers.jira.limit"),
+        ] {
+            write(&project, text);
+            let error = load(&inputs).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+        }
+
+        write(
+            &project,
+            "[leaders]\nfiles='@@'\n[ui]\npreview='disabled'\n[search]\nlimit=2\n[tokens]\ntokenizer='gpt-4o'\n[providers.jira]\nkey_prefix='g5'\n",
+        );
+        load(&inputs).unwrap();
+    }
+
+    #[test]
+    fn type_errors_and_leader_collisions_name_the_setting_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let inputs = inputs(&temp);
+        let project = inputs.repository_root.as_ref().unwrap().join(".tg.toml");
+
+        write(&project, "[search]\nlimit='many'\n");
+        let error = load(&inputs).unwrap_err().to_string();
+        assert!(error.contains(&project.display().to_string()), "{error}");
+        assert!(error.contains("search.limit"), "{error}");
+
+        write(&project, "[leaders]\nsymbols='@'\n");
+        let error = load(&inputs).unwrap_err().to_string();
+        assert!(error.contains(&project.display().to_string()), "{error}");
+        assert!(error.contains("leaders.symbols"), "{error}");
     }
 
     #[test]

@@ -66,7 +66,11 @@ pub(crate) fn apply_toml_patch(config: &mut Config, input: &str) -> Result<(), C
 fn parse_patch(input: &str) -> Result<ConfigPatch, ConfigError> {
     let value: toml::Value = toml::from_str(input).map_err(ConfigError::Toml)?;
     validate_known_keys(&value)?;
-    toml::from_str(input).map_err(ConfigError::Toml)
+    let deserializer = toml::de::Deserializer::parse(input).map_err(ConfigError::Toml)?;
+    serde_path_to_error::deserialize(deserializer).map_err(|error| ConfigError::Type {
+        path: error.path().to_string(),
+        message: error.inner().to_string(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,6 +485,7 @@ impl JiraProviderConfig {
 pub enum ConfigError {
     Toml(toml::de::Error),
     UnknownKey(String),
+    Type { path: String, message: String },
     Validation(ValidationError),
 }
 
@@ -489,6 +494,9 @@ impl fmt::Display for ConfigError {
         match self {
             Self::Toml(error) => write!(formatter, "invalid TOML: {error}"),
             Self::UnknownKey(path) => write!(formatter, "unknown configuration key `{path}`"),
+            Self::Type { path, message } => {
+                write!(formatter, "invalid value for `{path}`: {message}")
+            }
             Self::Validation(error) => error.fmt(formatter),
         }
     }
@@ -499,6 +507,7 @@ impl std::error::Error for ConfigError {
         match self {
             Self::Toml(error) => Some(error),
             Self::UnknownKey(_) => None,
+            Self::Type { .. } => None,
             Self::Validation(error) => Some(error),
         }
     }
