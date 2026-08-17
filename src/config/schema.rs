@@ -37,7 +37,7 @@ impl Config {
     /// Source discovery and multi-source precedence are intentionally handled
     /// outside the schema layer.
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
-        let patch: ConfigPatch = toml::from_str(input).map_err(ConfigError::Toml)?;
+        let patch = parse_patch(input)?;
         let mut config = Self::default();
         patch.apply(&mut config)?;
         config.normalize_and_validate()?;
@@ -55,6 +55,18 @@ impl Config {
         self.providers.validate()?;
         Ok(())
     }
+}
+
+pub(crate) fn apply_toml_patch(config: &mut Config, input: &str) -> Result<(), ConfigError> {
+    let patch = parse_patch(input)?;
+    patch.apply(config)?;
+    Ok(())
+}
+
+fn parse_patch(input: &str) -> Result<ConfigPatch, ConfigError> {
+    let value: toml::Value = toml::from_str(input).map_err(ConfigError::Toml)?;
+    validate_known_keys(&value)?;
+    toml::from_str(input).map_err(ConfigError::Toml)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,7 +92,7 @@ impl Default for EditorConfig {
 
 impl EditorConfig {
     fn validate(&self) -> Result<(), ValidationError> {
-        validate_range("editor.tab_width", self.tab_width, 1, 16)?;
+        validate_minimum("editor.tab_width", self.tab_width, 1)?;
         if !self.copy_command.starts_with(':')
             || self.copy_command.len() == 1
             || self.copy_command.chars().any(char::is_control)
@@ -133,14 +145,14 @@ impl UiConfig {
                 "must use application key notation such as `ctrl-p`",
             ));
         }
-        validate_range("ui.completion_height", self.completion_height, 1, 1_000)?;
+        validate_minimum("ui.completion_height", self.completion_height, 1)?;
         validate_range(
             "ui.completion_width_percent",
             self.completion_width_percent,
             1,
             100,
         )?;
-        validate_range("ui.status_timeout_ms", self.status_timeout_ms, 1, 600_000)?;
+        validate_minimum("ui.status_timeout_ms", self.status_timeout_ms, 1)?;
         Ok(())
     }
 }
@@ -261,8 +273,8 @@ impl Default for SearchConfig {
 
 impl SearchConfig {
     fn validate(&self) -> Result<(), ValidationError> {
-        validate_range("search.limit", self.limit, 1, 10_000)?;
-        validate_range("search.debounce_ms", self.debounce_ms, 1, 10_000)?;
+        validate_minimum("search.limit", self.limit, 1)?;
+        validate_minimum("search.debounce_ms", self.debounce_ms, 1)?;
         if self
             .broad_excludes
             .iter()
@@ -412,8 +424,8 @@ impl Default for GithubProviderConfig {
 impl GithubProviderConfig {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_command("providers.github.command", &self.command)?;
-        validate_range("providers.github.limit", self.limit, 1, 10_000)?;
-        validate_range("providers.github.timeout_ms", self.timeout_ms, 1, 300_000)
+        validate_minimum("providers.github.limit", self.limit, 1)?;
+        validate_minimum("providers.github.timeout_ms", self.timeout_ms, 1)
     }
 }
 
@@ -441,8 +453,8 @@ impl Default for JiraProviderConfig {
 impl JiraProviderConfig {
     fn normalize_and_validate(&mut self) -> Result<(), ValidationError> {
         validate_command("providers.jira.command", &self.command)?;
-        validate_range("providers.jira.limit", self.limit, 1, 10_000)?;
-        validate_range("providers.jira.timeout_ms", self.timeout_ms, 1, 300_000)?;
+        validate_minimum("providers.jira.limit", self.limit, 1)?;
+        validate_minimum("providers.jira.timeout_ms", self.timeout_ms, 1)?;
         if let Some(prefix) = &mut self.key_prefix {
             *prefix = prefix
                 .strip_suffix('-')
@@ -468,6 +480,7 @@ impl JiraProviderConfig {
 #[derive(Debug)]
 pub enum ConfigError {
     Toml(toml::de::Error),
+    UnknownKey(String),
     Validation(ValidationError),
 }
 
@@ -475,6 +488,7 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Toml(error) => write!(formatter, "invalid TOML: {error}"),
+            Self::UnknownKey(path) => write!(formatter, "unknown configuration key `{path}`"),
             Self::Validation(error) => error.fmt(formatter),
         }
     }
@@ -484,6 +498,7 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Toml(error) => Some(error),
+            Self::UnknownKey(_) => None,
             Self::Validation(error) => Some(error),
         }
     }
@@ -525,6 +540,7 @@ pub(crate) struct ConfigPatch {
 impl ConfigPatch {
     fn apply(self, config: &mut Config) -> Result<(), ValidationError> {
         if let Some(version) = self.version {
+            validate_version(version)?;
             config.version = version;
         }
         if let Some(patch) = self.editor {
@@ -550,6 +566,149 @@ impl ConfigPatch {
         }
         Ok(())
     }
+}
+
+fn validate_known_keys(value: &toml::Value) -> Result<(), ConfigError> {
+    let Some(root) = value.as_table() else {
+        return Ok(());
+    };
+    check_keys(
+        root,
+        "",
+        &[
+            "version",
+            "editor",
+            "ui",
+            "leaders",
+            "search",
+            "tokens",
+            "skills",
+            "providers",
+        ],
+    )?;
+    check_child(
+        root,
+        "editor",
+        &[
+            "line_numbers",
+            "current_line_absolute",
+            "tab_width",
+            "wrap",
+            "copy_command",
+        ],
+    )?;
+    check_child(
+        root,
+        "ui",
+        &[
+            "preview",
+            "preview_toggle",
+            "completion_height",
+            "completion_width_percent",
+            "status_timeout_ms",
+            "color",
+        ],
+    )?;
+    check_child(
+        root,
+        "leaders",
+        &[
+            "files",
+            "broad_files",
+            "symbols",
+            "skills",
+            "github_issues",
+            "github_pull_requests",
+            "jira_issues",
+        ],
+    )?;
+    check_child(root, "search", &["limit", "debounce_ms", "broad_excludes"])?;
+    check_child(
+        root,
+        "tokens",
+        &[
+            "tokenizer",
+            "decimals",
+            "show_file",
+            "show_symbol",
+            "show_total",
+        ],
+    )?;
+    check_child(
+        root,
+        "skills",
+        &["profile", "mention", "read_codex_disable_rules", "roots"],
+    )?;
+    if let Some(roots) = root
+        .get("skills")
+        .and_then(|value| value.get("roots"))
+        .and_then(toml::Value::as_array)
+    {
+        for (index, root) in roots.iter().enumerate() {
+            if let Some(table) = root.as_table() {
+                check_keys(
+                    table,
+                    &format!("skills.roots[{index}]"),
+                    &[
+                        "path",
+                        "scope",
+                        "discovery",
+                        "walk_ancestors",
+                        "contained",
+                        "metadata",
+                        "name_key",
+                        "description_key",
+                        "mention",
+                    ],
+                )?;
+            }
+        }
+    }
+    check_child(root, "providers", &["github", "jira"])?;
+    if let Some(providers) = root.get("providers").and_then(toml::Value::as_table) {
+        if let Some(github) = providers.get("github").and_then(toml::Value::as_table) {
+            check_keys(
+                github,
+                "providers.github",
+                &["enabled", "command", "limit", "timeout_ms"],
+            )?;
+        }
+        if let Some(jira) = providers.get("jira").and_then(toml::Value::as_table) {
+            check_keys(
+                jira,
+                "providers.jira",
+                &["enabled", "command", "key_prefix", "limit", "timeout_ms"],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn check_child(
+    parent: &toml::map::Map<String, toml::Value>,
+    child: &str,
+    allowed: &[&str],
+) -> Result<(), ConfigError> {
+    if let Some(table) = parent.get(child).and_then(toml::Value::as_table) {
+        check_keys(table, child, allowed)?;
+    }
+    Ok(())
+}
+
+fn check_keys(
+    table: &toml::map::Map<String, toml::Value>,
+    prefix: &str,
+    allowed: &[&str],
+) -> Result<(), ConfigError> {
+    if let Some(key) = table.keys().find(|key| !allowed.contains(&key.as_str())) {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        return Err(ConfigError::UnknownKey(path));
+    }
+    Ok(())
 }
 
 macro_rules! patch {
@@ -816,6 +975,19 @@ where
     Ok(())
 }
 
+fn validate_minimum<T>(path: &'static str, value: T, minimum: T) -> Result<(), ValidationError>
+where
+    T: Copy + Ord + fmt::Display,
+{
+    if value < minimum {
+        return Err(invalid(
+            path,
+            format!("must be at least {minimum}, got {value}"),
+        ));
+    }
+    Ok(())
+}
+
 fn invalid(path: &'static str, message: impl Into<String>) -> ValidationError {
     invalid_owned(path.into(), message)
 }
@@ -934,8 +1106,6 @@ mod tests {
             "[tokens]\ndecimals=4",
             "[providers.github]\nlimit=0",
             "[providers.github]\ntimeout_ms=0",
-            "[providers.jira]\nlimit=10001",
-            "[providers.jira]\ntimeout_ms=300001",
         ] {
             assert!(Config::from_toml(input).is_err(), "accepted {input}");
         }
