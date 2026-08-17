@@ -506,3 +506,198 @@ fn malformed_go_and_java_retain_usable_symbols_and_valid_ranges() {
         }
     }
 }
+
+#[test]
+fn detects_csharp_and_ruby_sources_and_conventional_ruby_filenames() {
+    for name in [
+        "Sample.cs",
+        "sample.rb",
+        "tasks.rake",
+        "example.gemspec",
+        "config.ru",
+        "Gemfile",
+        "Rakefile",
+        "Guardfile",
+        "Vagrantfile",
+        "Podfile",
+        "Fastfile",
+        "Appfile",
+        "Dangerfile",
+        "Berksfile",
+        "Capfile",
+    ] {
+        assert!(
+            tscodeselection::language::supports(Path::new(name)),
+            "{name}"
+        );
+    }
+    assert!(!tscodeselection::language::supports(Path::new(
+        "Sample.dll"
+    )));
+}
+
+#[test]
+fn extracts_csharp_namespaces_types_members_fields_and_definition_semantics() {
+    let parsed = tscodeselection::language::parse(&language_fixture("Sample.cs"))
+        .unwrap()
+        .unwrap();
+    let symbol = |qualified: &str| {
+        parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == qualified)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing {qualified}; got {:?}",
+                    parsed
+                        .symbols
+                        .iter()
+                        .map(|symbol| symbol.qualified_name.as_str())
+                        .collect::<Vec<_>>()
+                )
+            })
+    };
+
+    assert_eq!(symbol("Acme::Tools").kind, "module");
+    assert_eq!(symbol("Acme::Tools::IReader").kind, "interface");
+    assert!(!symbol("Acme::Tools::IReader::Name").is_definition);
+    assert!(!symbol("Acme::Tools::IReader::Read").is_definition);
+    assert!(symbol("Acme::Tools::IReader::Close").is_definition);
+    assert_eq!(symbol("Acme::Tools::Service").kind, "class");
+    assert_eq!(symbol("Acme::Tools::Service::name").kind, "field");
+    assert_eq!(symbol("Acme::Tools::Service::alias").kind, "field");
+    assert_eq!(symbol("Acme::Tools::Service::Title").kind, "property");
+    assert_eq!(symbol("Acme::Tools::Service::Service").kind, "method");
+    assert!(symbol("Acme::Tools::Service::Render").is_definition);
+    assert!(!symbol("Acme::Tools::Service::Missing").is_definition);
+    assert_eq!(symbol("Acme::Tools::Service::Inner").kind, "class");
+    assert!(symbol("Acme::Tools::Service::Inner::Save").is_definition);
+    assert_eq!(symbol("Acme::Tools::State::Ready").kind, "enum member");
+    assert_eq!(symbol("Acme::Tools::State::Named").kind, "enum member");
+    assert_eq!(symbol("Acme::Tools::Handler").kind, "delegate");
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| matches!(symbol.leaf_name.as_str(), "Hidden" | "Local" | "value"))
+    );
+
+    let cafe = symbol("Acme::Tools::Café");
+    assert_eq!(
+        &parsed.source[cafe.name_start_byte..cafe.name_end_byte],
+        "Café"
+    );
+    assert_eq!(symbol("Acme::Tools::Café::Crème").kind, "field");
+    let field = symbol("Acme::Tools::Service::alias");
+    let declaration = &parsed.source[field.range_start_byte..field.range_end_byte];
+    assert!(declaration.contains("name"));
+    assert!(declaration.contains("alias"));
+}
+
+#[test]
+fn extracts_ruby_scopes_methods_operators_aliases_and_constants() {
+    let parsed = tscodeselection::language::parse(&language_fixture("sample.rb"))
+        .unwrap()
+        .unwrap();
+    let symbol = |qualified: &str| {
+        parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == qualified)
+            .unwrap_or_else(|| panic!("missing {qualified}"))
+    };
+
+    assert_eq!(symbol("Acme").kind, "module");
+    assert_eq!(symbol("Acme::Service").kind, "class");
+    assert_eq!(symbol("Acme::Service::DEFAULT").kind, "constant");
+    assert_eq!(symbol("Acme::Service::render").kind, "method");
+    assert_eq!(symbol("Acme::Service::title=").kind, "method");
+    assert_eq!(symbol("Acme::Service::[]").kind, "method");
+    assert_eq!(symbol("Acme::Service::build").kind, "method");
+    assert_eq!(symbol("Acme::Service::start").kind, "method");
+    assert_eq!(symbol("Admin::User").leaf_name, "User");
+    assert_eq!(symbol("Admin::User::VALUE").kind, "constant");
+    assert_eq!(symbol("Admin::User::save").kind, "method");
+    assert_eq!(symbol("Widget::create").kind, "method");
+    assert_eq!(symbol("TOP_LEVEL").kind, "constant");
+    assert_eq!(symbol("Admin::EXPLICIT").kind, "constant");
+    assert!(!parsed.symbols.iter().any(|symbol| matches!(
+        symbol.leaf_name.as_str(),
+        "local" | "hidden" | "INNER" | "value" | "key"
+    )));
+
+    let cafe = symbol("Café");
+    assert_eq!(
+        &parsed.source[cafe.name_start_byte..cafe.name_end_byte],
+        "Café"
+    );
+    assert_eq!(symbol("Café::CRÈME").kind, "constant");
+    assert!(parsed.symbols.iter().all(|symbol| symbol.is_definition));
+}
+
+#[test]
+fn switches_between_csharp_and_ruby_parsers_in_both_directions() {
+    let csharp_source = fs::read_to_string(language_fixture("Sample.cs")).unwrap();
+    let ruby_source = fs::read_to_string(language_fixture("sample.rb")).unwrap();
+    let mut parser = tscodeselection::language::SymbolParser::new();
+    let csharp = parser
+        .parse_source(Path::new("First.cs"), csharp_source.clone())
+        .unwrap()
+        .unwrap();
+    assert!(
+        csharp
+            .symbols
+            .iter()
+            .any(|symbol| symbol.leaf_name == "Service")
+    );
+    let ruby = parser
+        .parse_source(Path::new("second.rb"), ruby_source.clone())
+        .unwrap()
+        .unwrap();
+    assert!(
+        ruby.symbols
+            .iter()
+            .any(|symbol| symbol.leaf_name == "DEFAULT")
+    );
+
+    let mut reverse = tscodeselection::language::SymbolParser::new();
+    reverse
+        .parse_source(Path::new("first.rb"), ruby_source)
+        .unwrap()
+        .unwrap();
+    let reparsed_csharp = reverse
+        .parse_source(Path::new("Second.cs"), csharp_source)
+        .unwrap()
+        .unwrap();
+    assert!(
+        reparsed_csharp
+            .symbols
+            .iter()
+            .any(|symbol| symbol.leaf_name == "Handler")
+    );
+}
+
+#[test]
+fn malformed_csharp_and_ruby_retain_usable_symbols_and_valid_ranges() {
+    for fixture in ["malformed.cs", "malformed.rb"] {
+        let parsed = tscodeselection::language::parse(&language_fixture(fixture))
+            .unwrap()
+            .unwrap();
+        for expected in ["Before", "Broken"] {
+            assert!(
+                parsed
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.leaf_name == expected),
+                "{fixture}: missing {expected}"
+            );
+        }
+        for symbol in &parsed.symbols {
+            assert!(parsed.source.is_char_boundary(symbol.name_start_byte));
+            assert!(parsed.source.is_char_boundary(symbol.name_end_byte));
+            assert!(symbol.name_start_byte < symbol.name_end_byte);
+            assert!(symbol.range_start_byte <= symbol.name_start_byte);
+            assert!(symbol.name_end_byte <= symbol.range_end_byte);
+        }
+    }
+}
