@@ -72,6 +72,7 @@ pub trait ReferenceProvider: Send + Sync {
             generation,
             candidates,
             completed: true,
+            progress: None,
         })
     }
 

@@ -163,6 +163,15 @@ impl ReferenceProvider for FileProvider {
 }
 
 pub fn file_version(path: &Path) -> Result<FileVersion> {
+    Ok(read_versioned(path)?.version)
+}
+
+pub(crate) struct VersionedFile {
+    pub bytes: Vec<u8>,
+    pub version: FileVersion,
+}
+
+pub(crate) fn read_versioned(path: &Path) -> Result<VersionedFile> {
     for _ in 0..2 {
         let mut file = File::open(path)?;
         let before = file.metadata()?;
@@ -170,10 +179,13 @@ pub fn file_version(path: &Path) -> Result<FileVersion> {
         file.read_to_end(&mut bytes)?;
         let after = file.metadata()?;
         if before.len() == after.len() && before.modified().ok() == after.modified().ok() {
-            return Ok(FileVersion {
-                size: after.len(),
-                modified: after.modified().ok(),
-                content_sha256: Sha256::digest(&bytes).into(),
+            return Ok(VersionedFile {
+                version: FileVersion {
+                    size: after.len(),
+                    modified: after.modified().ok(),
+                    content_sha256: Sha256::digest(&bytes).into(),
+                },
+                bytes,
             });
         }
     }

@@ -1,7 +1,7 @@
 use super::model::{
     AcceptedReference, CompletionActivation, GenerationId, LoweredReference, QueryEmission,
-    QueryRequest, ReferenceCandidate, ReferenceId, ReferenceKind, ResolvedReference, SessionUpdate,
-    SharedProvider, TextRange,
+    QueryProgress, QueryRequest, ReferenceCandidate, ReferenceId, ReferenceKind, ResolvedReference,
+    SessionUpdate, SharedProvider, TextRange,
 };
 use super::{BackgroundExecutor, CancellationFlag, ReferenceProvider};
 use anyhow::{Context, Result};
@@ -14,6 +14,7 @@ enum QueryMessage {
         generation: GenerationId,
         candidates: Vec<ReferenceCandidate>,
         completed: bool,
+        progress: Option<QueryProgress>,
     },
     Failed {
         generation: GenerationId,
@@ -132,6 +133,7 @@ impl ReferenceSession {
                         generation: emission.generation,
                         candidates: emission.candidates,
                         completed: emission.completed,
+                        progress: emission.progress,
                     })
                     .map_err(|_| anyhow::anyhow!("reference query receiver closed"))
             };
@@ -162,6 +164,7 @@ impl ReferenceSession {
                     generation,
                     candidates,
                     completed,
+                    progress,
                 } if generation == self.generation && self.active_kind.is_some() => {
                     let active_kind = self.active_kind.expect("guarded above");
                     if candidates.iter().all(|candidate| {
@@ -173,6 +176,7 @@ impl ReferenceSession {
                         self.selected = self.selected.min(self.candidates.len().saturating_sub(1));
                         update.candidates_changed = true;
                         update.completed |= completed;
+                        update.progress = progress.or(update.progress);
                     } else {
                         update.error = Some("provider returned inconsistent candidates".into());
                         update.completed = true;
@@ -361,6 +365,26 @@ mod tests {
             Ok(vec![Self::candidate(&request)])
         }
 
+        fn query_progressive(
+            &self,
+            request: QueryRequest,
+            cancellation: &CancellationFlag,
+            emit: &mut dyn FnMut(QueryEmission) -> Result<()>,
+        ) -> Result<()> {
+            let generation = request.generation;
+            let candidates = self.query(request, cancellation)?;
+            emit(QueryEmission {
+                generation,
+                candidates,
+                completed: true,
+                progress: Some(QueryProgress {
+                    scanned: 1,
+                    total: 2,
+                    indexed_symbols: 3,
+                }),
+            })
+        }
+
         fn resolve(&self, _id: &CandidateId) -> Result<ReferenceTarget> {
             bail!("not needed by this test")
         }
@@ -415,7 +439,16 @@ mod tests {
         assert!(new > old);
 
         executor.run(1);
-        assert!(session.drain().candidates_changed);
+        let update = session.drain();
+        assert!(update.candidates_changed);
+        assert_eq!(
+            update.progress,
+            Some(QueryProgress {
+                scanned: 1,
+                total: 2,
+                indexed_symbols: 3,
+            })
+        );
         assert_eq!(session.candidates()[0].display.primary, "new");
 
         executor.run(0);

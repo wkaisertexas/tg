@@ -1,8 +1,8 @@
-use super::file::file_version;
+use super::file::{file_version, read_versioned};
 use super::model::{
     CandidateDisplay, CandidateId, ContextCost, FileOrigin, FileTarget, FileVersion, Preview,
-    PreviewLine, QueryEmission, QueryRequest, QueryScope, ReferenceCandidate, ReferenceKind,
-    ReferenceTarget, SourceLocation, SymbolIdentity, SymbolTarget, ValidatedTarget,
+    PreviewLine, QueryEmission, QueryProgress, QueryRequest, QueryScope, ReferenceCandidate,
+    ReferenceKind, ReferenceTarget, SourceLocation, SymbolIdentity, SymbolTarget, ValidatedTarget,
 };
 use super::{CancellationFlag, ReferenceProvider};
 use crate::language::{self, ParsedFile, Symbol};
@@ -10,10 +10,11 @@ use crate::search::{self, SearchMode};
 use anyhow::{Context, Result, bail};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -25,22 +26,26 @@ struct IndexedSymbol {
     origin: FileOrigin,
 }
 
-enum IndexEvent {
-    Batch(Vec<IndexedSymbol>),
-    Done,
-}
-
 #[derive(Default)]
 struct RepositoryIndex {
     started: bool,
     done: bool,
     entries: Vec<IndexedSymbol>,
-    subscribers: Vec<Sender<IndexEvent>>,
+    scanned: usize,
+    total: usize,
+    subscribers: Vec<SyncSender<()>>,
 }
 
 struct CachedParse {
     version: FileVersion,
     parsed: Arc<ParsedFile>,
+}
+
+fn notify_subscribers(subscribers: &mut Vec<SyncSender<()>>) {
+    subscribers.retain(|sink| match sink.try_send(()) {
+        Ok(()) | Err(mpsc::TrySendError::Full(())) => true,
+        Err(mpsc::TrySendError::Disconnected(())) => false,
+    });
 }
 
 pub struct SymbolProvider {
@@ -51,7 +56,6 @@ pub struct SymbolProvider {
     index: Arc<Mutex<RepositoryIndex>>,
     parse_cache: Mutex<HashMap<PathBuf, CachedParse>>,
     targets: Mutex<HashMap<String, SymbolTarget>>,
-    next_candidate: AtomicU64,
     index_launches: Arc<AtomicUsize>,
     parse_count: AtomicUsize,
 }
@@ -73,26 +77,41 @@ impl SymbolProvider {
             index: Arc::new(Mutex::new(RepositoryIndex::default())),
             parse_cache: Mutex::new(HashMap::new()),
             targets: Mutex::new(HashMap::new()),
-            next_candidate: AtomicU64::new(0),
             index_launches: Arc::new(AtomicUsize::new(0)),
             parse_count: AtomicUsize::new(0),
         })
     }
 
     fn parse(&self, path: &Path) -> Result<Option<(Arc<ParsedFile>, FileVersion)>> {
+        self.parse_cancellable(path, None)
+    }
+
+    fn parse_cancellable(
+        &self,
+        path: &Path,
+        cancellation: Option<&CancellationFlag>,
+    ) -> Result<Option<(Arc<ParsedFile>, FileVersion)>> {
         let canonical = path.canonicalize()?;
         anyhow::ensure!(
             canonical.starts_with(&self.canonical_root),
             "file is outside search root"
         );
-        let version = file_version(&canonical)?;
+        if cancellation.is_some_and(CancellationFlag::is_cancelled) {
+            return Ok(None);
+        }
+        let snapshot = read_versioned(&canonical)?;
+        let version = snapshot.version;
         if let Some(cached) = self.parse_cache.lock().unwrap().get(&canonical)
             && cached.version == version
         {
             return Ok(Some((Arc::clone(&cached.parsed), version)));
         }
+        if cancellation.is_some_and(CancellationFlag::is_cancelled) {
+            return Ok(None);
+        }
         self.parse_count.fetch_add(1, Ordering::Relaxed);
-        let Some(parsed) = language::parse(&canonical)? else {
+        let source = String::from_utf8(snapshot.bytes).context("source is not valid UTF-8")?;
+        let Some(parsed) = language::parse_source(&canonical, source)? else {
             return Ok(None);
         };
         let parsed = Arc::new(parsed);
@@ -113,19 +132,8 @@ impl SymbolProvider {
         typed_leader: &str,
     ) -> ReferenceCandidate {
         let target = target_for(entry);
-        let opaque = self
-            .next_candidate
-            .fetch_add(1, Ordering::Relaxed)
-            .to_string();
+        let opaque = stable_candidate_id(&target);
         self.targets.lock().unwrap().insert(opaque.clone(), target);
-        let floor = self
-            .next_candidate
-            .load(Ordering::Relaxed)
-            .saturating_sub(4096);
-        self.targets
-            .lock()
-            .unwrap()
-            .retain(|key, _| key.parse::<u64>().is_ok_and(|value| value >= floor));
         let symbol = &entry.symbol;
         ReferenceCandidate {
             id: CandidateId {
@@ -167,8 +175,12 @@ impl SymbolProvider {
         request: &QueryRequest,
         path: &Path,
         origin: FileOrigin,
+        cancellation: &CancellationFlag,
     ) -> Result<Vec<ReferenceCandidate>> {
-        let Some((parsed, version)) = self.parse(path)? else {
+        let Some((parsed, version)) = self.parse_cancellable(path, Some(cancellation))? else {
+            if cancellation.is_cancelled() {
+                return Ok(Vec::new());
+            }
             bail!("symbol completion is unavailable for this file")
         };
         let canonical_path = path.canonicalize()?;
@@ -180,6 +192,7 @@ impl SymbolProvider {
         Ok(language::find_symbols(&parsed.symbols, &request.query)
             .into_iter()
             .take(request.limit)
+            .take_while(|_| !cancellation.is_cancelled())
             .map(|symbol| IndexedSymbol {
                 relative_path: relative.clone(),
                 canonical_path: canonical_path.clone(),
@@ -191,10 +204,15 @@ impl SymbolProvider {
             .collect())
     }
 
-    fn subscribe_index(&self) -> (Vec<IndexedSymbol>, bool, Receiver<IndexEvent>) {
-        let (sender, receiver) = mpsc::channel();
+    fn subscribe_index(&self) -> (Vec<IndexedSymbol>, QueryProgress, bool, Receiver<()>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
         let mut index = self.index.lock().unwrap();
         let snapshot = index.entries.clone();
+        let progress = QueryProgress {
+            scanned: index.scanned,
+            total: index.total,
+            indexed_symbols: index.entries.len(),
+        };
         let done = index.done;
         if !done {
             index.subscribers.push(sender);
@@ -203,7 +221,7 @@ impl SymbolProvider {
             index.started = true;
             self.start_index_worker();
         }
-        (snapshot, done, receiver)
+        (snapshot, progress, done, receiver)
     }
 
     fn start_index_worker(&self) {
@@ -218,6 +236,11 @@ impl SymbolProvider {
                 .into_iter()
                 .filter(|path| language::supports(path))
                 .collect();
+            {
+                let mut state = index.lock().unwrap();
+                state.total = files.len();
+                notify_subscribers(&mut state.subscribers);
+            }
             language::install_indexing(|| {
                 files.par_chunks(batch_size).for_each(|paths| {
                     let mut entries = Vec::new();
@@ -228,12 +251,18 @@ impl SymbolProvider {
                         if !canonical_path.starts_with(&canonical_root) {
                             continue;
                         }
-                        let Ok(Some(parsed)) = language::parse_indexed(&canonical_path) else {
+                        let Ok(snapshot) = read_versioned(&canonical_path) else {
                             continue;
                         };
-                        let Ok(source_version) = file_version(&canonical_path) else {
+                        let Ok(source) = String::from_utf8(snapshot.bytes) else {
                             continue;
                         };
+                        let Ok(Some(parsed)) =
+                            language::parse_indexed_source(&canonical_path, source)
+                        else {
+                            continue;
+                        };
+                        let source_version = snapshot.version;
                         let relative_path = path
                             .strip_prefix(&root)
                             .unwrap_or(path)
@@ -248,17 +277,14 @@ impl SymbolProvider {
                         }));
                     }
                     let mut state = index.lock().unwrap();
-                    state.entries.extend(entries.iter().cloned());
-                    state
-                        .subscribers
-                        .retain(|sink| sink.send(IndexEvent::Batch(entries.clone())).is_ok());
+                    state.scanned += paths.len();
+                    state.entries.extend(entries);
+                    notify_subscribers(&mut state.subscribers);
                 });
             });
             let mut state = index.lock().unwrap();
             state.done = true;
-            state
-                .subscribers
-                .retain(|sink| sink.send(IndexEvent::Done).is_ok());
+            notify_subscribers(&mut state.subscribers);
             state.subscribers.clear();
         });
     }
@@ -269,25 +295,28 @@ impl SymbolProvider {
         cancellation: &CancellationFlag,
         emit: &mut dyn FnMut(QueryEmission) -> Result<()>,
     ) -> Result<()> {
-        let (mut entries, done, receiver) = self.subscribe_index();
-        if !entries.is_empty() || done {
-            emit(self.emission(&request, &entries, done))?;
-        }
+        let (mut entries, progress, done, receiver) = self.subscribe_index();
+        emit(self.emission(&request, &entries, done, progress))?;
         if done {
             return Ok(());
         }
         while !cancellation.is_cancelled() {
             match receiver.recv_timeout(std::time::Duration::from_millis(20)) {
-                Ok(IndexEvent::Batch(batch)) => {
-                    entries.extend(batch);
-                    emit(self.emission(&request, &entries, false))?;
-                }
-                Ok(IndexEvent::Done) => {
-                    emit(self.emission(&request, &entries, true))?;
-                    break;
+                Ok(()) => {
+                    let (new_entries, progress, done) = self.index_snapshot(entries.len());
+                    entries.extend(new_entries);
+                    emit(self.emission(&request, &entries, done, progress))?;
+                    if done {
+                        break;
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let (new_entries, progress, done) = self.index_snapshot(entries.len());
+                    entries.extend(new_entries);
+                    emit(self.emission(&request, &entries, done, progress))?;
+                    break;
+                }
             }
         }
         Ok(())
@@ -298,6 +327,7 @@ impl SymbolProvider {
         request: &QueryRequest,
         entries: &[IndexedSymbol],
         completed: bool,
+        progress: QueryProgress,
     ) -> QueryEmission {
         let candidates = rank_repository_symbols(entries, &request.query, request.limit)
             .into_iter()
@@ -309,7 +339,21 @@ impl SymbolProvider {
             generation: request.generation,
             candidates,
             completed,
+            progress: Some(progress),
         }
+    }
+
+    fn index_snapshot(&self, seen: usize) -> (Vec<IndexedSymbol>, QueryProgress, bool) {
+        let state = self.index.lock().unwrap();
+        (
+            state.entries[seen.min(state.entries.len())..].to_vec(),
+            QueryProgress {
+                scanned: state.scanned,
+                total: state.total,
+                indexed_symbols: state.entries.len(),
+            },
+            state.done,
+        )
     }
 
     #[cfg(test)]
@@ -351,11 +395,12 @@ impl ReferenceProvider for SymbolProvider {
         }
         match &request.scope {
             QueryScope::File { path, origin } => {
-                let candidates = self.file_query(&request, path, *origin)?;
+                let candidates = self.file_query(&request, path, *origin, cancellation)?;
                 emit(QueryEmission {
                     generation: request.generation,
                     candidates,
                     completed: true,
+                    progress: None,
                 })
             }
             QueryScope::Repository => self.repository_query(request, cancellation, emit),
@@ -505,6 +550,27 @@ fn target_for(entry: &IndexedSymbol) -> SymbolTarget {
         markdown_anchor: language::is_markdown_symbol(&entry.symbol)
             .then(|| language::markdown_slug(&entry.symbol.leaf_name)),
     }
+}
+
+fn stable_candidate_id(target: &SymbolTarget) -> String {
+    let mut digest = Sha256::new();
+    digest.update(target.file.canonical_path.to_string_lossy().as_bytes());
+    digest.update(target.file.relative_path.as_bytes());
+    digest.update([match target.file.origin {
+        FileOrigin::GitAware => 0,
+        FileOrigin::Broad => 1,
+    }]);
+    digest.update(target.identity.language.as_bytes());
+    digest.update(target.identity.qualified_name.as_bytes());
+    digest.update(target.identity.leaf_name.as_bytes());
+    digest.update(target.identity.kind.as_bytes());
+    digest.update([u8::from(target.identity.is_definition)]);
+    digest.update(target.start_byte.to_le_bytes());
+    digest.update(target.end_byte.to_le_bytes());
+    if let Some(version) = &target.file.source_version {
+        digest.update(version.content_sha256);
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn rank_repository_symbols<'a>(
@@ -696,11 +762,41 @@ mod tests {
         assert_eq!(provider.index_launch_count(), 1);
         assert!(emissions.len() >= 2);
         assert!(emissions.last().unwrap().completed);
+        let progress = emissions.last().unwrap().progress.unwrap();
+        assert_eq!(progress.scanned, 2);
+        assert_eq!(progress.total, 2);
+        assert_eq!(
+            progress.indexed_symbols,
+            emissions.last().unwrap().candidates.len()
+        );
         assert!(
             emissions
                 .iter()
                 .all(|emission| emission.generation == GenerationId(7))
         );
+        let ignored_id = emissions
+            .last()
+            .unwrap()
+            .candidates
+            .iter()
+            .find(|candidate| candidate.friendly_text.contains("ignored.rs"))
+            .unwrap()
+            .id
+            .clone();
+        let entries = provider.index.lock().unwrap().entries.clone();
+        let repeated = provider.emission(
+            &request(7, "", QueryScope::Repository),
+            &entries,
+            true,
+            progress,
+        );
+        assert!(
+            repeated
+                .candidates
+                .iter()
+                .any(|candidate| candidate.id == ignored_id)
+        );
+        provider.resolve(&ignored_id).unwrap();
         assert!(
             emissions
                 .last()
@@ -741,6 +837,25 @@ mod tests {
             &fs::read_to_string(&path).unwrap()[refreshed.name_start_byte..refreshed.name_end_byte],
             "naïve"
         );
+    }
+
+    #[test]
+    fn parsed_symbols_and_version_share_the_same_byte_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("snapshot.rs");
+        fs::write(&path, "fn before() {}\n").unwrap();
+        let snapshot = read_versioned(&path).unwrap();
+        fs::write(&path, "fn after() {}\n").unwrap();
+        let parsed =
+            language::parse_source(&path, String::from_utf8(snapshot.bytes.clone()).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(parsed.symbols[0].leaf_name, "before");
+        assert_eq!(
+            snapshot.version.content_sha256,
+            Sha256::digest(&snapshot.bytes).as_slice()
+        );
+        assert_ne!(snapshot.version, file_version(&path).unwrap());
     }
 
     #[test]

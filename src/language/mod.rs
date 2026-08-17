@@ -60,6 +60,10 @@ impl SymbolParser {
     pub fn parse(&mut self, path: &Path) -> Result<Option<ParsedFile>> {
         parse_with_parser(path, &mut self.parser, &mut self.flavor)
     }
+
+    pub fn parse_source(&mut self, path: &Path, source: String) -> Result<Option<ParsedFile>> {
+        parse_source_with_parser(path, source, &mut self.parser, &mut self.flavor)
+    }
 }
 
 impl Default for SymbolParser {
@@ -151,22 +155,33 @@ pub fn parse(path: &Path) -> Result<Option<ParsedFile>> {
     SymbolParser::new().parse(path)
 }
 
+pub fn parse_source(path: &Path, source: String) -> Result<Option<ParsedFile>> {
+    SymbolParser::new().parse_source(path, source)
+}
+
 fn parse_with_parser(
     path: &Path,
     parser: &mut Parser,
     current_flavor: &mut Option<Flavor>,
 ) -> Result<Option<ParsedFile>> {
+    let bytes = std::fs::read(path)?;
+    let source = String::from_utf8(bytes).context("source is not valid UTF-8")?;
+    parse_source_with_parser(path, source, parser, current_flavor)
+}
+
+fn parse_source_with_parser(
+    path: &Path,
+    source: String,
+    parser: &mut Parser,
+    current_flavor: &mut Option<Flavor>,
+) -> Result<Option<ParsedFile>> {
     if is_markdown(path) {
-        let bytes = std::fs::read(path)?;
-        let source = String::from_utf8(bytes).context("source is not valid UTF-8")?;
         let symbols = parse_markdown_headings(&source);
         return Ok(Some(ParsedFile { source, symbols }));
     }
     let Some((language, flavor)) = grammar(path) else {
         return Ok(None);
     };
-    let bytes = std::fs::read(path)?;
-    let source = String::from_utf8(bytes).context("source is not valid UTF-8")?;
     if *current_flavor != Some(flavor) {
         parser.set_language(&language)?;
         *current_flavor = Some(flavor);
@@ -213,6 +228,10 @@ thread_local! {
 
 pub fn parse_indexed(path: &Path) -> Result<Option<ParsedFile>> {
     INDEX_PARSER.with(|parser| parser.borrow_mut().parse(path))
+}
+
+pub fn parse_indexed_source(path: &Path, source: String) -> Result<Option<ParsedFile>> {
+    INDEX_PARSER.with(|parser| parser.borrow_mut().parse_source(path, source))
 }
 
 pub fn install_indexing<R: Send>(operation: impl FnOnce() -> R + Send) -> R {

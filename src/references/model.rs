@@ -212,6 +212,14 @@ pub struct SessionUpdate {
     pub candidates_changed: bool,
     pub completed: bool,
     pub error: Option<String>,
+    pub progress: Option<QueryProgress>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryProgress {
+    pub scanned: usize,
+    pub total: usize,
+    pub indexed_symbols: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +227,7 @@ pub struct QueryEmission {
     pub generation: GenerationId,
     pub candidates: Vec<ReferenceCandidate>,
     pub completed: bool,
+    pub progress: Option<QueryProgress>,
 }
 
 pub(crate) type SharedProvider = Arc<dyn super::ReferenceProvider>;
