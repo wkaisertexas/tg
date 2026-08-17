@@ -433,6 +433,10 @@ impl ReferenceSession {
         self.candidates.get(self.selected)
     }
 
+    pub fn selected_index(&self) -> usize {
+        self.selected
+    }
+
     pub fn select_next(&mut self) {
         if !self.candidates.is_empty() {
             let selected = (self.selected + 1).min(self.candidates.len() - 1);

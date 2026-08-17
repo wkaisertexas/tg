@@ -22,7 +22,7 @@ fn real_main() -> Result<()> {
     let repository = tscodeselection::repository::Repository::discover(&root_folder)?;
     let cwd = std::env::current_dir().context("cannot determine current working directory")?;
     let config_inputs = cli.config_inputs(&cwd, &repository.search_root);
-    let _loaded_config =
+    let loaded_config =
         tscodeselection::config::load(&config_inputs).context("could not load configuration")?;
 
     if let Some(prompt) = cli.resolve {
@@ -35,5 +35,5 @@ fn real_main() -> Result<()> {
         tscodeselection::app::is_terminal(),
         "interactive mode requires a terminal; use --resolve for headless operation"
     );
-    tscodeselection::app::run(repository)
+    tscodeselection::app::run(repository, loaded_config.config)
 }
