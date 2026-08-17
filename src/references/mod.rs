@@ -5,6 +5,7 @@ pub mod jira;
 pub mod model;
 mod process;
 pub mod session;
+pub mod skill;
 pub mod symbol;
 
 use anyhow::Result;
