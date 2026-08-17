@@ -4,6 +4,12 @@ A Rust terminal composer for fuzzy file references and syntax-aware symbol selec
 `@` respects Git ignores; `%` searches ignored files too. C, C++, Rust, Python, and Markdown
 code lowers to `path::line:column Name`; Markdown lowers to compact `path.md#heading` anchors.
 
+The next version is being designed as a focused Vim-like prompt editor that can
+be used through `VISUAL`/`EDITOR` or as `tg FILE`. See
+[`docs/spec.md`](docs/spec.md), [`docs/editor-design.md`](docs/editor-design.md),
+[`docs/reference-providers.md`](docs/reference-providers.md), and
+[`docs/configuration-ui.md`](docs/configuration-ui.md).
+
 ## Scaffold
 
 - `src/app.rs` — Ratatui REPL, input handling, results, and source preview

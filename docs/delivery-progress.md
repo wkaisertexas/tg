@@ -1,4 +1,9 @@
-# Delivery Progress
+# v0.1 Selector Delivery Record
+
+This file records the shipped selector MVP. Its product specification and
+implementation plan have been superseded by [`spec.md`](spec.md) and
+[`impl-plan.md`](impl-plan.md), which define the migration to the `tg` prompt
+editor. The completed work below is the reusable migration baseline.
 
 - [x] Inspect repository state and release metadata availability.
 - [x] Rename the shipped binary to `tg` and preserve tested CLI behavior.

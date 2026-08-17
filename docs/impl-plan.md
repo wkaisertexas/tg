@@ -1,411 +1,358 @@
-# Symbol-Aware File Selector MVP Implementation Plan
+# `tg` Prompt Editor Implementation Plan
 
 ## 1. Purpose
 
-This plan derives from [`spec.md`](spec.md). It breaks the MVP into increments
-that remain runnable and testable while preserving the specification's key
-boundary: file search is repository-wide, but symbol parsing begins only after
-a file path resolves.
+This plan migrates the shipped v0.1 selector into the prompt editor specified
+by [`spec.md`](spec.md). Each phase should leave the repository buildable and
+retain the existing extraction, search, lowering, installer, updater, and
+benchmark coverage.
 
-The repository is initially empty, so the first phase establishes both the Rust
-workspace and its testing conventions.
+## 2. Migration Principles
 
-## 2. Proposed Project Layout
+- Extract reusable services before replacing the application shell.
+- Keep existing tests passing unless a documented product behavior changed.
+- Put editor state, provider state, and rendering in separate modules.
+- Run filesystem work, parsing, tokenization, and subprocesses off the UI
+  thread and reject stale generations.
+- Introduce no dynamic plugin ABI.
+- Never make `gh` or `jira` authentication a prerequisite for local features.
+- Preserve release artifact names and the `tg` executable.
+
+## 3. Target Module Shape
 
 ```text
-.
-├── Cargo.toml
-├── docs/
-│   ├── spec.md
-│   └── impl-plan.md
-├── src/
-│   ├── main.rs
-│   ├── app.rs
-│   ├── cli.rs
+src/
+├── main.rs
+├── cli.rs
+├── app/
+│   ├── mod.rs
 │   ├── event.rs
-│   ├── repository.rs
-│   ├── search/
-│   │   ├── mod.rs
-│   │   ├── walker.rs
-│   │   └── matcher.rs
-│   ├── composer/
-│   │   ├── mod.rs
-│   │   ├── reference.rs
-│   │   └── lowering.rs
-│   ├── language/
-│   │   ├── mod.rs
-│   │   ├── symbol.rs
-│   │   ├── c.rs
-│   │   ├── cpp.rs
-│   │   ├── rust.rs
-│   │   └── python.rs
-│   ├── parse_cache.rs
-│   ├── preview.rs
-│   └── ui/
-│       ├── mod.rs
-│       ├── composer.rs
-│       ├── results.rs
-│       └── preview.rs
-└── tests/
-    ├── fixtures/
-    │   ├── c/
-    │   ├── cpp/
-    │   ├── rust/
-    │   ├── python/
-    │   └── search_repo/
-    ├── repository.rs
-    ├── search.rs
-    ├── extraction.rs
-    └── lowering.rs
+│   ├── command.rs
+│   └── render.rs
+├── editor/
+│   ├── mod.rs
+│   ├── document.rs
+│   ├── reference_ranges.rs
+│   └── save.rs
+├── config/
+│   ├── mod.rs
+│   ├── schema.rs
+│   └── sources.rs
+├── references/
+│   ├── mod.rs
+│   ├── model.rs
+│   ├── session.rs
+│   ├── file.rs
+│   ├── symbol.rs
+│   ├── skill.rs
+│   ├── github.rs
+│   └── jira.rs
+├── tokens.rs
+├── language/
+├── search/
+├── repository.rs
+├── preview.rs
+└── updater.rs
 ```
 
-The exact module split may change as code emerges. The important boundaries are
-that UI code does not contain language queries, language adapters do not own
-terminal state, and lowering can be tested without running a terminal.
+The exact filenames may change, but `app.rs` must no longer own indexing,
+provider logic, document lowering, clipboard encoding, key interpretation, and
+all rendering in one type.
 
-## 3. Phase 1: Bootstrap and Core Types
+## 4. Phase 0: Characterization
 
-### Work
+Before structural changes:
 
-- Create a binary Cargo package using Rust 2024 edition.
-- Add `clap`, error-handling, logging, and initial terminal dependencies.
-- Define the CLI with one required root-directory argument.
-- Define core types:
-  - `SearchMode::{GitAware, Broad}`;
-  - `ResolvedFile`;
-  - `SymbolKind`;
-  - `Symbol`;
-  - `ResolvedReference`;
-  - `SourcePoint`; and
-  - query-generation identifiers for background work.
-- Decide on one-based wrapper types or explicit conversion methods so
-  zero-based Tree-sitter points cannot be emitted accidentally.
-- Establish `cargo fmt`, `cargo clippy --all-targets --all-features`, and
-  `cargo test` as the baseline validation commands.
+- add tests around current `@`, `%`, `::`, Markdown, ambiguity, stale-file,
+  OSC 52, and repository-discovery behavior;
+- capture representative rendered results independently of the current layout;
+- record current benchmark baselines; and
+- add a pseudo-terminal harness that can drive a terminal binary.
 
-### Verification
+This phase establishes which existing behavior is intentionally preserved and
+which behavior changes under the new specification.
 
-- CLI parsing accepts a directory argument and rejects omission.
-- Unit tests cover point conversion and path-display normalization.
-- The binary starts, reports the canonical invocation root, and exits cleanly.
+## 5. Phase 1: Configuration Foundation
 
-## 4. Phase 2: Repository Discovery
+Add typed configuration with compiled defaults and support:
 
-### Work
+- XDG or `~/.config/tg/config.toml` user path;
+- repository `.tg.toml`;
+- restricted project overrides;
+- the small `TG_*` environment surface;
+- CLI overrides;
+- strict unknown-key diagnostics; and
+- leader validation.
 
-- Canonicalize and validate the invocation root.
-- Discover the nearest containing Git worktree root.
-- Represent “no repository found” explicitly rather than as an error.
-- Normalize emitted paths relative to the selected search root.
-- Reject canonical paths that escape the search root.
-- Handle Git worktrees where `.git` is a file rather than a directory.
+Use `serde`, `toml`, and optionally `figment` for source layering. Do not permit
+repository config to select provider executables or external skill roots.
 
-Prefer a small, testable abstraction. `git2` avoids spawning a process, while
-invoking `git rev-parse --show-toplevel` may better match installed Git
-semantics. Choose one and record the reason in code documentation.
+Verification:
 
-### Verification
+- unit tests for every precedence layer and safety restriction;
+- fixture configs for the documented schema; and
+- `tg --help` documents file, root, config, and update behavior.
 
-- Integration tests cover invocation at the repository root and in a nested
-  directory.
-- Tests cover a non-Git directory.
-- Tests cover a worktree-style `.git` file if the selected discovery library
-  does not already guarantee it.
-- Tests ensure relative output paths contain no `..` components.
+## 6. Phase 2: Reference Engine Extraction
 
-## 5. Phase 3: Independent File Search Service
+Move current file and symbol completion out of `App` behind provider-neutral
+types:
 
-### Work
+- `ReferenceKind`;
+- `QueryRequest` and generation ID;
+- `ReferenceCandidate`;
+- `ReferenceTarget`;
+- `ResolvedReference`; and
+- validation, lowering, preview, and context-cost results.
 
-- Build a long-lived search session around `ignore::WalkBuilder` and `nucleo`.
-- Run walking and matching outside the UI thread.
-- Tag result snapshots with a generation number and discard stale generations.
-- Include regular files and hidden files.
-- Match against full search-root-relative paths.
-- Return matched-character indices for UI highlighting.
-- Implement the two walker policies:
-  - `@`: Git and ignore processing enabled;
-  - `%`: ignore processing disabled, with `.git` excluded explicitly.
-- Do not follow symlinks outside the canonical search root.
-- Surface unreadable-entry errors as nonfatal status events.
-- Avoid default exclusions for `target`, `node_modules`, or generated folders.
+Adapt `search`, `language`, `composer`, and `preview` rather than rewriting
+them. Repository-wide symbol indexing remains lazy and batched.
 
-The initial implementation can create one session per search mode and reuse its
-walked candidates for subsequent queries. It must be possible to cancel or drop
-a session without leaking worker threads.
+Verification:
 
-### Verification
+- all current extraction and lowering fixtures pass through the new boundary;
+- stale generations are discarded;
+- file changes re-resolve or invalidate symbols; and
+- no provider work occurs on a render-thread test executor.
 
-- A fixture repository proves that `@` omits ignored files.
-- The same fixture proves that `%` includes ignored files and excludes `.git`.
-- Tests cover hidden files, path-fragment queries, disappearing entries,
-  internal symlinks, external symlinks, and cycles.
-- A unit test proves an old query's late snapshot cannot replace newer results.
+## 7. Phase 3: GPT-4o Token Service
 
-## 6. Phase 4: Language Registry and Parse Pipeline
+Add `tiktoken-rs` and initialize the `o200k_base` singleton lazily. Implement:
 
-### Work
+- whole-file counts;
+- symbol-range counts using existing byte ranges;
+- metadata and tokenizer-keyed caching;
+- one-decimal `k` formatting;
+- pending/unavailable states; and
+- deduplicated live totals with whole-file subsumption.
 
-- Add Tree-sitter and pinned grammar crates for C, C++, Rust, and Python.
-- Map conventional extensions to a language adapter.
-- Treat ambiguous C/C++ headers as C++ for the MVP.
-- Decode supported source as UTF-8.
-- Parse error-tolerantly and retain trees containing error nodes.
-- Build line-start offsets once per parsed source.
-- Return an explicit unsupported/binary/decode-failed state rather than a
-  generic error.
+Do not use a bytes-per-token estimate while exact GPT-4o counting is pending;
+display an ellipsis.
 
-### Verification
+Verification:
 
-- Each supported extension selects the expected grammar.
-- Unsupported extensions produce a whole-file-only result.
-- Invalid UTF-8 disables parsing without panicking.
-- A malformed fixture with valid declarations around an error produces a tree
-  and reaches extraction.
+- known strings match checked-in token-count fixtures;
+- Unicode symbol slices use valid byte boundaries;
+- cache invalidation follows metadata changes;
+- duplicated file/range identities total correctly; and
+- counting large files does not stall input.
 
-## 7. Phase 5: Common Symbol Extraction
+## 8. Phase 4: Core Language Adapter Expansion
 
-### Work
+Preserve the current C, C++, Rust, Python, and Markdown fixtures, then add the
+remaining core-tier adapters in small groups:
 
-- Define grammar-specific Tree-sitter queries or visitors for each supported
-  language.
-- Extract the common declaration categories from the specification.
-- Prefer the declaration identifier's range over its enclosing node's start.
-- Build best-effort parent relationships and qualified-name segments.
-- Exclude locals and parameters by construction, using ancestor context rather
-  than name-based filtering.
-- Preserve duplicate declarations as separate candidates.
-- Provide symbol ranking that prefers exact leaf matches, prefixes, fuzzy leaf
-  matches, and finally qualified-path matches as appropriate.
+1. JavaScript, JSX, TypeScript, and TSX;
+2. Go and Java;
+3. C# and Ruby; and
+4. Bash and POSIX shell.
 
-Implement and test one language fully before copying the adapter pattern to the
-others. Rust is a good first adapter because its declarations and module/type
-nesting provide broad coverage of the common model. C++ should be implemented
-early enough to validate namespaces, nested records, and ambiguous names.
+Each group adds pinned grammar crates, extension and conventional-filename
+detection, symbol queries, malformed-source coverage, duplicate-name coverage,
+and representative benchmarks. A grammar dependency without extraction
+fixtures does not mark the language supported.
 
-### Language Fixture Minimums
+Extended-tier adapters follow after the editor gate and ship independently.
+Prioritize them from demonstrated user demand, grammar maintenance quality, and
+the usefulness of their named structural units. Start with Nix, HCL/Terraform,
+Kotlin, Swift/Objective-C, PHP, SQL, YAML, TOML, JSON/JSONC, GraphQL, Protocol
+Buffers, Vue, and Svelte before the remaining extended list.
 
-Each language fixture should contain:
+Before planning any adapter, verify that a maintained
+`tree-sitter-<language>` package exists, is consumable from Rust, and has a
+compatible license and release history. If that gate fails, remove or defer the
+language; do not implement, fork, or vendor a grammar in this repository.
 
-- a top-level function;
-- a named record-like type;
-- a method or analogous nested callable;
-- a field;
-- an enum and enum member;
-- a type alias;
-- nested declarations where supported;
-- duplicate leaf names under different parents;
-- a local variable and parameter that must not be extracted; and
-- at least one syntax error outside another valid declaration.
+## 9. Phase 5: Editor Widget Spike
 
-### Verification
+Build a narrow prototype branch or example for `vimltui` that proves:
 
-- Snapshot tests list extracted symbols with kind, qualified name, and
-  one-based identifier position.
-- Tests prove leaf-only search finds a nested symbol.
-- Tests prove qualified queries improve ranking.
-- Tests prove duplicate leaf names remain independently selectable.
-- Tests prove local variables and parameters are absent.
+- required Normal/Insert/Visual behavior;
+- absolute-current plus relative-other line numbers;
+- multiline Unicode and bracketed paste;
+- custom rendering for structured reference spans;
+- interception of `:w`, `:q`, `:q!`, `:wq`, and `:copy`;
+- completion overlay event routing;
+- `Ctrl-P` preview toggling; and
+- undo/redo integration with external reference metadata.
 
-## 8. Phase 6: Parse Cache and Preview Provider
+If any of the last four require invasive patching or cannot be made reliable,
+repeat the spike with `edtui`. Record the selection and limitations in an
+architecture decision note before integrating it.
 
-### Work
+The prompt buffers in scope do not justify introducing Ropey independently of
+the chosen widget.
 
-- Add a cache keyed by canonical path, size, and modification time.
-- Cache decoded source, line starts, extracted symbols, and optionally the
-  Tree-sitter tree.
-- Bound the cache by entry count or approximate bytes.
-- Invalidate cache entries when metadata changes.
-- Build preview windows with five lines before and after a declaration start.
-- Add identifier highlighting derived from byte ranges.
-- Support vertical scrolling beyond the initial window and horizontal
-  scrolling or deterministic truncation.
-- Preserve the path as a sticky preview header.
+## 10. Phase 6: Document, Save, and Clipboard
 
-### Verification
+Implement `Document` around the selected widget:
 
-- Repeated symbol completion for an unchanged file hits the cache.
-- Changing a file invalidates its cache entry.
-- Beginning-of-file and end-of-file previews clamp correctly.
-- Preview line numbers and highlight columns agree with emitted locations.
-- Long lines and multiline syntax nodes do not corrupt layout state.
+- open existing or new UTF-8 files;
+- track revision and saved revision;
+- map or invalidate structured spans through transactions;
+- include metadata in undo/redo history;
+- detect external changes;
+- render immutable lowered snapshots;
+- atomically write snapshots; and
+- implement `:copy` with the existing OSC 52 encoder.
 
-## 9. Phase 7: Composer and Structured References
+Update the CLI to `tg [OPTIONS] [FILE]`. Repository discovery follows
+`--root`, process CWD Git root, file-parent Git root, then CWD.
 
-### Work
+Verification:
 
-- Implement an editable composer model independently of Ratatui widgets.
-- Detect `@` and `%` only at valid token boundaries.
-- Track completion state as a state machine:
-  - inactive;
-  - searching for a file;
-  - file resolved;
-  - searching for a symbol;
-  - symbol resolved; and
-  - stale or invalid.
-- Store accepted references as structured spans associated with composer text.
-- Update spans as text is inserted or deleted outside them.
-- Invalidate a token when editing changes its display reference.
-- Preserve a selected symbol ID/range even when the display text uses only its
-  leaf name.
-- Define a way to enter literal `@` and `%` text or dismiss unintended
-  completion.
+- unit tests cover range mapping and lowering;
+- save-failure injection never corrupts the destination;
+- a parent-process test confirms synchronous external-editor behavior; and
+- `:copy` bytes equal `:w` bytes for the same document revision.
 
-### Verification
+## 11. Phase 7: Minimal Application Shell
 
-- Table-driven tests cover token boundaries, punctuation, multiple references,
-  Unicode surrounding text, edits before and after a reference, edits inside a
-  reference, and dismissal.
-- A duplicate leaf-name selection remains bound to the chosen candidate.
-- `%path::symbol` cannot begin symbol search until `path` uniquely resolves.
+Replace the current persistent header, transcript, result pane, preview pane,
+and five-line prompt box with:
 
-## 10. Phase 8: Lowering and Stale-Reference Validation
+- full-screen editor;
+- line-number gutter;
+- one status line; and
+- completion overlay created only while a provider query is active.
 
-### Work
+Add manual preview toggling with `Ctrl-P`. Keep result navigation distinct from
+that binding. Add narrow-terminal degradation and no-color behavior.
 
-- Implement lowering as a pure operation over composer text and structured
-  reference spans.
-- Convert file-only references to relative paths.
-- Convert symbol references to one-based `path::line:column SymbolName`.
-- Preserve all non-reference text.
-- Validate file existence and metadata immediately before submission.
-- Reparse stale symbol files and attempt to identify the selected declaration
-  by stable descriptive fields such as kind, qualified name, leaf name, and
-  nearby source identity.
-- Block submission if re-resolution is missing or ambiguous.
-- Write successful lowered text plus a newline directly to stdout, without
-  quoting or JSON serialization.
+Verification:
 
-The lowering module must not own terminal rendering. It should return either a
-plain string or a structured validation error that lets the application focus
-the affected token.
+- snapshots prove idle mode has no completion or preview chrome;
+- relative numbering follows cursor movement;
+- overlays remain within terminal bounds;
+- status totals update as spans change; and
+- terminal state restores after normal and injected-error exits.
 
-### Verification
+## 12. Phase 8: Local Skill Discovery
 
-- Golden tests cover prompts containing zero, one, and multiple references.
-- Tests cover both search sigils and file-only versus symbol references.
-- Tests prove punctuation adjacent to references is preserved.
-- Tests prove output lines and columns are one-based.
-- Tests prove stale references are relocated when unique and rejected when
-  ambiguous or missing.
-- A byte-for-byte test proves the output is unescaped plain text.
+Implement the built-in `codex-local` profile without app-server calls:
 
-## 11. Phase 9: Ratatui REPL Integration
+- repository ancestor `.agents/skills` roots;
+- `~/.agents/skills`;
+- legacy and bundled `$CODEX_HOME/skills` roots;
+- `/etc/codex/skills`;
+- locally installed plugin manifest skill roots;
+- symlink and cycle handling;
+- `SKILL.md` frontmatter;
+- optional `agents/openai.yaml` interface metadata; and
+- applicable Codex `[[skills.config]]` disable rules.
 
-### Work
+Then implement generic TOML skill roots and mention templates. Accepting a
+skill inserts only the agent-native mention.
 
-- Implement terminal setup and guaranteed restoration on normal exit, error,
-  and panic where practical.
-- Decide how to keep submitted stdout clean while rendering the TUI. Prefer a
-  design that does not use stdout for both persistent output and control
-  sequences, or explicitly suspend/restore rendering around submission.
-- Render the composer, result list, status/transcript area, and preview.
-- Connect file search to `@` and `%` composer states.
-- Connect accepted files to on-demand parsing and symbol completion.
-- Implement candidate navigation, acceptance, dismissal, submission, preview
-  scrolling, and exit keys.
-- Visually distinguish:
-  - Git-aware versus broad search;
-  - file versus symbol candidates;
-  - resolved versus unresolved references; and
-  - current versus stale references.
-- Degrade to a compact layout in small terminals.
-- Clear the composer after a successful submission and keep the REPL running.
+Verification:
 
-### Verification
+- fixtures mirror repository, user, admin, bundled, and plugin layouts;
+- disabled and malformed skills do not appear;
+- duplicates show scope/path disambiguation; and
+- no Codex executable or server is needed.
 
-- Reducer/state tests cover key events without requiring a real terminal.
-- Manual testing confirms terminal restoration after `Ctrl-C`, `Ctrl-D`, and a
-  forced parse error.
-- Manual testing confirms submitted stdout contains no ANSI control sequences.
-- Manual testing covers an ignored C++ fixture and an unqualified nested symbol.
+## 13. Phase 9: GitHub Provider
 
-## 12. Phase 10: End-to-End MVP Validation
+Add separate issue and pull-request providers using `gh` JSON output. Commands
+run without a shell, infer repository and host through `gh`, inherit its normal
+authentication, and return full URLs.
 
-### Automated Checks
+Add timeouts, output caps, cancellation, error normalization, and missing-CLI
+diagnostics.
+
+Verification uses a fake `gh` executable to assert arguments, environment
+noninterference, JSON parsing, exact-number ranking, enterprise URLs, timeouts,
+and failures. An opt-in manual test covers a real authenticated repository.
+
+## 14. Phase 10: Jira Provider
+
+Add Jira search using `jira --raw` JSON and inherited CLI configuration.
+Implement:
+
+- configured project-key prefix;
+- digits-only expansion such as `123` to `G5-123`;
+- preservation of complete explicit keys;
+- text search through JQL in the configured project;
+- Jira base-URL discovery; and
+- full `/browse/KEY` lowering.
+
+Verification uses a fake `jira` executable and fixtures for Cloud and
+on-premises response shapes, basic/bearer/mTLS-compatible inherited settings,
+prefix normalization, malformed JSON, timeouts, and authentication errors.
+
+## 15. Phase 11: Headless and Compatibility Cleanup
+
+Update `--resolve` to use the new lowering engine where operations are
+deterministic without an interactive candidate selection. Keep exact file,
+symbol, skill, GitHub URL, and Jira URL resolution scriptable where possible.
+
+Remove the old REPL transcript and multi-submission behavior. Update examples,
+README instructions, shell snippets for setting `VISUAL`/`EDITOR`, and Nix
+packaging. Mark old v0.1 UI documentation as historical.
 
 Run:
 
-```text
+```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
+nix flake check
+cargo bench --bench repository
 ```
 
-Add an end-to-end harness around the application state and services where
-possible. Full pseudo-terminal snapshot testing is optional for the MVP if it
-would dominate implementation effort.
+## 16. Phase 12: Release and Installer Verification
 
-### Manual Acceptance Script
+Preserve existing release targets, checksum publication, installer environment
+overrides, and `tg update`. Add smoke tests that install the built artifact and
+drive:
 
-1. Create a Git fixture with tracked Rust and C++ files, an ignored generated
-   directory, and duplicate nested symbol names.
-2. Start the application from a subdirectory of that fixture.
-3. Confirm the displayed search root is the Git worktree root.
-4. Confirm `@` omits the ignored fixture.
-5. Confirm `%` finds it using incomplete path segments.
-6. Resolve the ignored file and enter `::` symbol completion.
-7. Find a nested symbol by leaf name only.
-8. Confirm the path header, qualified candidate label, kind, location, and
-   five-before/five-after preview.
-9. Scroll beyond the initial preview window.
-10. Compose a sentence containing both a file-only and a symbol reference.
-11. Submit and confirm stdout contains the expected plain paths and
-    `path::line:column SymbolName` value with no control sequences or escaping.
-12. Submit a second prompt without restarting the application.
-13. Modify a selected source file before submission and confirm re-resolution
-    or an actionable stale-reference state.
+- `tg --version`;
+- `tg --help`;
+- a headless resolution;
+- direct editing in a pseudo-terminal; and
+- external-editor invocation from a parent process.
 
-## 13. Implementation Risks and Mitigations
+Add pseudo-terminal installer tests for the optional shell setup. The tests
+must cover both variables already set, each variable independently unset, both
+unset, Enter/default refusal, explicit `EDITOR`/`VISUAL`/both choices, existing
+rc-file assignments, Bash and Zsh selection, an unknown shell, no controlling
+terminal, and `TG_NO_EDITOR_PROMPT=1`. Every prompt shows the destination and
+exact lines before appending; no refusal or skipped case changes an rc file.
 
-### Terminal output versus TUI rendering
+Release notes must call out that `tg .` no longer opens the selector REPL and
+show the new `tg FILE` and `tg --root DIR FILE` forms.
 
-Both typically use stdout. Mixing them could contaminate machine-consumable
-prompt output with ANSI sequences. Isolate UI rendering from submitted output
-and add a byte-level manual or pseudo-terminal check.
+## 17. Suggested Dependencies
 
-### Grammar-version drift
+Retain:
 
-Tree-sitter node names and query compatibility can change. Pin grammar versions
-in `Cargo.lock`, keep queries local to each adapter, and use extraction snapshot
-tests as the compatibility boundary.
+- `ratatui`, `crossterm`, `ignore`, `tree-sitter` and grammar crates;
+- `rayon`, `clap`, `serde`, `reqwest`, `sha2`, `base64`, and `anyhow`.
 
-### C and C++ declaration complexity
+Evaluate or add:
 
-Declarators can place identifiers deeply inside pointer, function, template,
-and qualified nodes. Centralize “find declaration identifier” helpers per
-language and accept documented omissions rather than approximating a compiler.
+- `vimltui`, with `edtui` as the fallback editor widget;
+- `tiktoken-rs` for GPT-4o `o200k_base` counting;
+- `figment` plus `toml` for layered typed configuration;
+- `nucleo` to replace `fuzzy-matcher` after provider extraction;
+- `serde_json` for `gh` and `jira` output; and
+- a small cancellation/channel abstraction only if standard channels become
+  unwieldy.
 
-### Incorrect local-symbol inclusion
+Do not add an HTTP GitHub/Jira client, credential store, dynamic-loading crate,
+LSP stack, embedding model, or general editor framework.
 
-Broad queries can accidentally capture locals. Make extraction context-aware
-and include negative fixtures for locals and parameters in every language.
+## 18. Delivery Gates
 
-### Broad-search resource use
+The work should be released in coherent gates:
 
-`%` intentionally traverses ignored dependency and build trees. Keep it
-cancellable, stream partial results, avoid parsing files during the walk, and
-make the active mode obvious. Do not add speculative default exclusions beyond
-`.git` without changing the specification.
+1. **Core gate:** config, provider-neutral references, token counts, and the
+   complete core language tier behind the current UI.
+2. **Editor gate:** file lifecycle, Vim widget, minimal UI, save lowering, and
+   `:copy`.
+3. **Context gate:** local skills, GitHub, and Jira providers.
+4. **Release gate:** docs, compatibility cleanup, benchmarks, packaging, and
+   installer smoke tests.
 
-### File mutation and stale positions
-
-Modification timestamps can have coarse resolution. Include file size in cache
-keys and consider a lightweight content hash when validating a selected symbol
-at submission.
-
-## 14. Completion Order
-
-The recommended delivery order is:
-
-1. bootstrap and discovery;
-2. headless dual-mode file search;
-3. headless parsing and extraction for all four languages;
-4. preview and cache;
-5. composer token model and lowering;
-6. integrated TUI; and
-7. end-to-end hardening.
-
-Do not start with the full-screen interface. The search, extraction, reference,
-and lowering layers should be demonstrably correct through headless tests before
-terminal event handling is added.
+Each gate must be usable without the later providers and must not regress
+local file or symbol search performance materially from the recorded baseline.
