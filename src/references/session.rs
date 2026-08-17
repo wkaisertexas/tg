@@ -489,6 +489,10 @@ impl ReferenceSession {
         &self.candidates
     }
 
+    pub fn completion_active(&self) -> bool {
+        self.active_kind.is_some()
+    }
+
     pub fn selected(&self) -> Option<&ReferenceCandidate> {
         self.candidates.get(self.selected)
     }

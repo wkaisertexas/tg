@@ -144,6 +144,32 @@ impl Document {
         }
     }
 
+    /// Builds a document from bytes captured by the save layer's stable open.
+    /// This avoids a second content read between conflict-baseline capture and
+    /// entering raw terminal mode.
+    pub fn from_opened_bytes(
+        path: impl AsRef<Path>,
+        bytes: Vec<u8>,
+        existed: bool,
+    ) -> Result<Self> {
+        let logical = path.as_ref().to_path_buf();
+        let text = String::from_utf8(bytes).context("document is not valid UTF-8")?;
+        let path = if existed {
+            let metadata = std::fs::metadata(&logical)?;
+            ensure!(metadata.is_file(), "document path is not a regular file");
+            DocumentPath::Existing {
+                canonical: logical.canonicalize()?,
+                logical,
+                original_len: metadata.len(),
+                original_modified: metadata.modified().ok(),
+                original_permissions: metadata.permissions(),
+            }
+        } else {
+            DocumentPath::New { logical }
+        };
+        Ok(Self::from_state(path, text))
+    }
+
     fn from_state(path: DocumentPath, text: String) -> Self {
         let state = State {
             text,
@@ -197,6 +223,35 @@ impl Document {
     pub fn mark_saved(&mut self) {
         self.saved_state = self.state.clone();
         self.saved_revision = self.revision;
+    }
+
+    /// Applies refreshed provider targets without changing friendly text,
+    /// history, revision, or dirty state.
+    pub fn refresh_reference_targets(&mut self, refreshed: Vec<ResolvedReference>) -> Result<()> {
+        ensure!(
+            refreshed.len() == self.state.references.len(),
+            "refreshed reference count changed"
+        );
+        for (current, replacement) in self.state.references.iter().zip(&refreshed) {
+            ensure!(
+                current.id == replacement.id
+                    && current.range == replacement.range
+                    && current.friendly_text == replacement.friendly_text,
+                "refreshed reference identity or range changed"
+            );
+        }
+        for replacement in &refreshed {
+            if let Some(saved) = self
+                .saved_state
+                .references
+                .iter_mut()
+                .find(|saved| saved.id == replacement.id)
+            {
+                saved.target = replacement.target.clone();
+            }
+        }
+        self.state.references = refreshed;
+        Ok(())
     }
 
     pub fn begin_insert_group(&mut self) {

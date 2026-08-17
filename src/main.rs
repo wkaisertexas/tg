@@ -19,10 +19,20 @@ fn real_main() -> Result<()> {
     let cwd = std::env::current_dir().context("cannot determine current working directory")?;
     // File validation deliberately precedes terminal setup. Invalid UTF-8,
     // directories, and missing parents therefore cannot leave raw mode active.
-    let document = match cli.file() {
-        Some(path) => tscodeselection::editor::Document::open(path)
-            .with_context(|| format!("could not open document {}", path.display()))?,
-        None => tscodeselection::editor::Document::unnamed(),
+    let (document, save_target) = match cli.file() {
+        Some(path) => {
+            let opened = tscodeselection::editor::save::SaveTarget::open(path)
+                .with_context(|| format!("could not open document {}", path.display()))?;
+            let existed = opened.target.existed_at_baseline();
+            let document = tscodeselection::editor::Document::from_opened_bytes(
+                opened.target.logical_path(),
+                opened.bytes,
+                existed,
+            )
+            .with_context(|| format!("could not decode document {}", path.display()))?;
+            (document, Some(opened.target))
+        }
+        None => (tscodeselection::editor::Document::unnamed(), None),
     };
     let environment_root = std::env::var_os("TG_ROOT");
     let repository = tscodeselection::repository::Repository::for_editor(
@@ -49,5 +59,6 @@ fn real_main() -> Result<()> {
         repository,
         config: loaded_config.config,
         document,
+        save_target,
     })
 }

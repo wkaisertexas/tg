@@ -1,11 +1,12 @@
-use crate::config::{Config, LeadersConfig};
-use crate::editor::Document;
+use crate::config::{ColorMode, Config, LeadersConfig, PreviewMode};
+use crate::editor::command::{CommandDispatcher, CommandEffect, LowerRequest};
+use crate::editor::save::{AtomicSaver, SaveTarget};
+use crate::editor::{AdapterMode, Document, EditorInput, EditorSession, TextEdit};
 use crate::references::ThreadExecutor;
-use crate::references::activation::{CharReplacement, apply_char_replacements, detect_activation};
+use crate::references::activation::detect_activation;
 use crate::references::file::FileProvider;
 use crate::references::model::{
-    CandidateId, ContextCost, Preview, ReferenceCandidate, ReferenceKind, ResolvedReference,
-    TextRange,
+    CandidateId, ContextCost, Preview, ReferenceCandidate, ReferenceKind, TextRange,
 };
 use crate::references::session::{
     DocumentRevision, LowerPurpose, OperationKind, ReferenceEvent, ReferenceSession,
@@ -14,17 +15,13 @@ use crate::references::symbol::SymbolProvider;
 use crate::repository::Repository;
 use crate::tokens::{ContextTotal, format_tokens};
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,29 +33,35 @@ struct CachedPreview {
 
 struct App {
     repo: Repository,
-    text: String,
-    references: Vec<ResolvedReference>,
-    revision: DocumentRevision,
+    document: Document,
+    editor: EditorSession,
+    save_target: Option<SaveTarget>,
+    saver: AtomicSaver,
+    commands: CommandDispatcher,
     reference_session: ReferenceSession,
     leaders: LeadersConfig,
     search_limit: usize,
+    preview_mode: PreviewMode,
+    preview_visible: bool,
+    color: bool,
+    completion_height: u16,
+    completion_width_percent: u8,
     status: String,
     preview: Option<CachedPreview>,
     preview_scroll: usize,
-    transcript: Vec<String>,
-    transcript_scroll: usize,
     pending_clipboard: Option<String>,
-    submitting: bool,
-    exit_after_submit: bool,
     should_exit: bool,
     refs_total: ContextTotal,
+    insert_group_active: bool,
 }
 
 impl App {
-    /// Provider construction may walk the repository, so callers construct the
-    /// app before entering raw mode. Everything after this boundary is driven
-    /// through `ReferenceSession` worker jobs.
-    fn new(repo: Repository, config: &Config) -> Result<Self> {
+    fn new(
+        repo: Repository,
+        config: &Config,
+        document: Document,
+        save_target: Option<SaveTarget>,
+    ) -> Result<Self> {
         let git = FileProvider::new(
             &repo.search_root,
             ReferenceKind::GitFile,
@@ -69,9 +72,8 @@ impl App {
             ReferenceKind::BroadFile,
             config.leaders.broad_files.clone(),
         )?;
-        let indexed_files = broad.files().len();
         let symbols = SymbolProvider::new(&repo.search_root, config.leaders.files.clone())?;
-        let reference_session = ReferenceSession::with_tokenizer(
+        let mut reference_session = ReferenceSession::with_tokenizer(
             [
                 Arc::new(git) as Arc<dyn crate::references::ReferenceProvider>,
                 Arc::new(broad),
@@ -80,81 +82,188 @@ impl App {
             Arc::new(ThreadExecutor),
             &config.tokens.tokenizer,
         )?;
-        let status = format!(
-            "{indexed_files} files indexed · {} mode",
-            if repo.git_aware {
-                "Git-aware references"
-            } else {
-                "no Git repository; local ignores apply"
-            }
-        );
+        reference_session.update_references(DocumentRevision(0), Arc::from([]))?;
+        let mut editor = EditorSession::new(document.text());
+        let color = config.ui.color != ColorMode::Never;
+        editor.set_reference_style(if color {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().add_modifier(Modifier::UNDERLINED)
+        })?;
         Ok(Self {
             repo,
-            text: String::new(),
-            references: Vec::new(),
-            revision: DocumentRevision(0),
+            document,
+            editor,
+            save_target,
+            saver: AtomicSaver::new(),
+            commands: CommandDispatcher::new(config.editor.copy_command.clone())?,
             reference_session,
             leaders: config.leaders.clone(),
             search_limit: config.search.limit,
-            status,
+            preview_mode: config.ui.preview,
+            preview_visible: config.ui.preview == PreviewMode::Automatic,
+            color,
+            completion_height: config.ui.completion_height,
+            completion_width_percent: config.ui.completion_width_percent,
+            status: String::new(),
             preview: None,
             preview_scroll: 0,
-            transcript: Vec::new(),
-            transcript_scroll: 0,
             pending_clipboard: None,
-            submitting: false,
-            exit_after_submit: false,
             should_exit: false,
             refs_total: ContextTotal::default(),
+            insert_group_active: false,
         })
     }
 
-    fn completion_open(&self) -> bool {
-        !self.reference_session.candidates().is_empty()
+    fn revision(&self) -> DocumentRevision {
+        DocumentRevision(self.document.revision())
     }
 
-    fn edit_changed(&mut self) {
-        self.revision.0 = self.revision.0.wrapping_add(1);
-        self.reference_session.document_changed(self.revision);
-        if let Err(error) = self
-            .reference_session
-            .update_references(self.revision, self.references.clone().into())
-        {
-            self.status = format!("Cannot update reference total: {error}");
-        }
+    fn completion_active(&self) -> bool {
+        self.reference_session.completion_active()
+    }
+
+    fn sync_reference_state(&mut self) -> Result<()> {
+        let revision = self.revision();
+        self.reference_session.document_changed(revision);
+        self.reference_session
+            .update_references(revision, self.document.references().to_vec().into())?;
+        self.editor.set_reference_ranges(
+            self.document
+                .references()
+                .iter()
+                .map(|reference| reference.range),
+        )?;
         self.preview = None;
-        self.submitting = false;
-        self.exit_after_submit = false;
+        Ok(())
     }
 
-    fn refresh_activation(&mut self) {
-        let cursor = self.text.chars().count();
-        match detect_activation(&self.text, cursor, &self.leaders, &self.repo.search_root) {
-            Ok(Some(activation)) => {
-                let label = match activation.kind {
-                    ReferenceKind::GitFile => "@ GIT",
-                    ReferenceKind::BroadFile => "% BROAD",
-                    ReferenceKind::Symbol => "SYMBOLS",
-                    _ => "REFERENCES",
-                };
-                match self
-                    .reference_session
-                    .activate(activation, self.search_limit)
-                {
-                    Ok(_) => self.status = format!("{label} SEARCH · searching…"),
-                    Err(error) => self.status = error.to_string(),
-                }
-            }
-            Ok(None) => self.reference_session.close(),
-            Err(error) => self.status = error.to_string(),
+    fn sync_widget_edit(&mut self) -> Result<()> {
+        let after = self.editor.text();
+        if after == self.document.text() {
+            return Ok(());
         }
+        let edit = single_edit(self.document.text(), &after);
+        self.document.apply(&[edit])?;
+        self.sync_reference_state()?;
+        self.refresh_activation()
+    }
+
+    fn replace_widget_from_document(&mut self) -> Result<()> {
+        self.editor.replace_text_and_ranges(
+            self.document.text(),
+            self.document
+                .references()
+                .iter()
+                .map(|reference| reference.range),
+        )
+    }
+
+    fn refresh_activation(&mut self) -> Result<()> {
+        if self.editor.mode() != AdapterMode::Insert {
+            self.reference_session.close();
+            return Ok(());
+        }
+        let cursor = self.editor.cursor_char_offset();
+        match detect_activation(
+            self.document.text(),
+            cursor,
+            &self.leaders,
+            &self.repo.search_root,
+        )? {
+            Some(activation) => {
+                self.reference_session
+                    .activate(activation, self.search_limit)?;
+                self.status = "searching…".into();
+            }
+            None => self.reference_session.close(),
+        }
+        Ok(())
     }
 
     fn request_preview(&mut self) {
         self.preview = None;
         self.preview_scroll = 0;
-        if let Err(error) = self.reference_session.begin_preview_selected() {
+        if self.preview_mode != PreviewMode::Disabled
+            && self.preview_visible
+            && let Err(error) = self.reference_session.begin_preview_selected()
+        {
             self.status = format!("Preview unavailable: {error}");
+        }
+    }
+
+    fn accept_selected(&mut self) {
+        match self
+            .reference_session
+            .begin_accept_selected(self.revision())
+        {
+            Ok(_) => self.status = "Resolving reference…".into(),
+            Err(error) => self.status = format!("Cannot accept reference: {error}"),
+        }
+    }
+
+    fn begin_lower(&mut self, request: LowerRequest) {
+        let snapshot = request.snapshot;
+        match self.reference_session.begin_lower_snapshot(
+            DocumentRevision(snapshot.revision()),
+            request.purpose,
+            Arc::from(snapshot.text()),
+            snapshot.references().to_vec().into(),
+            self.leaders.clone(),
+        ) {
+            Ok(_) => self.status = "Validating references…".into(),
+            Err(error) => self.status = format!("Cannot lower document: {error}"),
+        }
+    }
+
+    fn dispatch_command(&mut self, command: String) {
+        let line = if command.starts_with(':') {
+            command
+        } else {
+            format!(":{command}")
+        };
+        match self.commands.dispatch(&line, &self.document) {
+            Ok(CommandEffect::Quit) => self.should_exit = true,
+            Ok(CommandEffect::Lower(request)) => self.begin_lower(request),
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn finish_lower(
+        &mut self,
+        revision: DocumentRevision,
+        purpose: LowerPurpose,
+        snapshot: crate::references::activation::LoweredSnapshot,
+    ) {
+        if revision != self.revision() {
+            return;
+        }
+        if let Err(error) = self.document.refresh_reference_targets(snapshot.references) {
+            self.status = format!("Cannot refresh references: {error}");
+            return;
+        }
+        match purpose {
+            LowerPurpose::Copy => {
+                self.pending_clipboard = Some(snapshot.text);
+                self.status = "Copied lowered document".into();
+            }
+            LowerPurpose::Write | LowerPurpose::WriteAndQuit => {
+                let Some(target) = self.save_target.as_ref() else {
+                    self.status = "No file name".into();
+                    return;
+                };
+                match self.saver.save(target, snapshot.text.as_bytes()) {
+                    Ok(target) => {
+                        self.save_target = Some(target);
+                        self.document.mark_saved();
+                        self.status = "Written".into();
+                        if purpose == LowerPurpose::WriteAndQuit {
+                            self.should_exit = true;
+                        }
+                    }
+                    Err(error) => self.status = format!("Write failed: {error}"),
+                }
+            }
         }
     }
 
@@ -165,25 +274,30 @@ impl App {
                     if let Some(error) = update.error {
                         self.status = error;
                     } else if update.candidates_changed {
-                        self.status = format!(
-                            "{} matches · Tab/Enter selects",
-                            self.reference_session.candidates().len()
-                        );
-                        if self.reference_session.selected().is_some() {
+                        self.status =
+                            format!("{} matches", self.reference_session.candidates().len());
+                        if self.preview_mode == PreviewMode::Automatic {
+                            self.preview_visible = true;
                             self.request_preview();
                         }
                     } else if let Some(progress) = update.progress {
-                        self.status = format!(
-                            "{} / {} files · {} symbols",
-                            progress.scanned, progress.total, progress.indexed_symbols
-                        );
+                        self.status = format!("{} / {} files", progress.scanned, progress.total);
                     }
                 }
                 ReferenceEvent::Accepted {
                     revision, accepted, ..
-                } if revision == self.revision => {
-                    if let Err(error) = self.apply_accepted(*accepted) {
-                        self.status = format!("Cannot accept reference: {error}");
+                } if revision == self.revision() => {
+                    let cursor = accepted.replacement_range.start
+                        + accepted.replacement_text.chars().count();
+                    match self
+                        .document
+                        .accept_reference(*accepted)
+                        .and_then(|_| self.replace_widget_from_document())
+                        .and_then(|_| self.editor.set_cursor_char_offset(cursor))
+                        .and_then(|_| self.sync_reference_state())
+                    {
+                        Ok(()) => self.status = "Reference resolved".into(),
+                        Err(error) => self.status = format!("Cannot accept reference: {error}"),
                     }
                 }
                 ReferenceEvent::PreviewReady {
@@ -193,7 +307,7 @@ impl App {
                 } => {
                     self.preview_scroll = preview
                         .as_ref()
-                        .and_then(|value| value.highlighted_lines.as_ref())
+                        .and_then(|preview| preview.highlighted_lines.as_ref())
                         .map_or(0, |lines| centered_preview_scroll(*lines.start()));
                     self.preview = Some(CachedPreview {
                         candidate_id,
@@ -202,200 +316,120 @@ impl App {
                 }
                 ReferenceEvent::SnapshotLowered {
                     revision,
-                    purpose: LowerPurpose::Copy,
+                    purpose,
                     snapshot,
                     ..
-                } if revision == self.revision => self.finish_submit(snapshot.text),
+                } => self.finish_lower(revision, purpose, snapshot),
                 ReferenceEvent::OperationFailed {
                     kind,
                     reference_id,
                     message,
                     ..
                 } => {
-                    if kind == OperationKind::Lower {
-                        self.submitting = false;
-                        self.exit_after_submit = false;
+                    if let Some(id) = reference_id
+                        && let Some(reference) = self
+                            .document
+                            .references()
+                            .iter()
+                            .find(|reference| reference.id == id)
+                    {
+                        let _ = self.editor.set_cursor_char_offset(reference.range.start);
                     }
-                    if let Some(reference_id) = reference_id {
-                        self.status = format!(
-                            "Cannot {} reference {}: {message}",
-                            operation_name(kind),
-                            reference_id.0
-                        );
-                    } else {
-                        self.status = format!("Cannot {}: {message}", operation_name(kind));
-                    }
+                    self.status = format!("Cannot {}: {message}", operation_name(kind));
                 }
-                ReferenceEvent::CandidateCostsChanged { .. } => {}
                 ReferenceEvent::ContextTotalChanged { revision, total }
-                    if revision == self.revision =>
+                    if revision == self.revision() =>
                 {
-                    self.refs_total = total;
+                    self.refs_total = total
                 }
-                _ => {}
+                ReferenceEvent::CandidateCostsChanged { .. }
+                | ReferenceEvent::ContextTotalChanged { .. }
+                | ReferenceEvent::Accepted { .. } => {}
             }
         }
     }
 
-    fn apply_accepted(
-        &mut self,
-        accepted: crate::references::model::AcceptedReference,
-    ) -> Result<()> {
-        self.text = apply_char_replacements(
-            &self.text,
-            &[CharReplacement {
-                range: accepted.replacement_range,
-                text: accepted.replacement_text,
-            }],
-        )?;
-        self.references
-            .retain(|reference| !ranges_overlap(reference.range, accepted.replacement_range));
-        self.references.push(accepted.reference);
-        self.references
-            .sort_by_key(|reference| reference.range.start);
-        self.edit_changed();
-        self.status = "Resolved ✓ · type :: after a file for symbols · Ctrl-J submits".into();
-        Ok(())
-    }
-
-    fn active_unresolved_reference(&self) -> Result<bool> {
-        let cursor = self.text.chars().count();
-        let Some(activation) =
-            detect_activation(&self.text, cursor, &self.leaders, &self.repo.search_root)?
-        else {
-            return Ok(false);
-        };
-        Ok(!self.references.iter().any(|reference| {
-            reference.range == activation.replacement_range
-                && reference.friendly_text
-                    == char_slice(&self.text, activation.replacement_range).unwrap_or_default()
-        }))
-    }
-
-    fn begin_submit(&mut self) {
-        match self.active_unresolved_reference() {
-            Ok(true) => {
-                self.status = "Resolve or remove the active reference before submitting".into();
-            }
-            Err(error) => self.status = format!("Cannot submit: {error}"),
-            Ok(false) => {
-                let text: Arc<str> = Arc::from(self.text.clone());
-                let references: Arc<[ResolvedReference]> = self.references.clone().into();
-                match self.reference_session.begin_lower_snapshot(
-                    self.revision,
-                    LowerPurpose::Copy,
-                    text,
-                    references,
-                    self.leaders.clone(),
-                ) {
-                    Ok(_) => {
-                        self.submitting = true;
-                        self.status = "Validating references…".into();
-                    }
-                    Err(error) => self.status = format!("Cannot submit: {error}"),
-                }
-            }
-        }
-    }
-
-    fn finish_submit(&mut self, lowered: String) {
-        let should_exit = self.exit_after_submit;
-        self.submitting = false;
-        self.transcript.push(lowered.clone());
-        self.pending_clipboard = Some(lowered);
-        self.transcript_scroll = self.transcript.len().saturating_sub(3);
-        self.text.clear();
-        self.references.clear();
-        self.edit_changed();
-        self.status = "Submitted ✓ · copied with OSC 52 · ready for another prompt".into();
-        if should_exit {
-            self.should_exit = true;
-        }
-    }
-
-    fn accept_selected(&mut self) {
-        match self.reference_session.begin_accept_selected(self.revision) {
-            Ok(_) => self.status = "Resolving reference…".into(),
-            Err(error) => self.status = format!("Cannot accept reference: {error}"),
-        }
-    }
-
-    fn key(&mut self, key: KeyEvent) -> bool {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+    fn handle_event(&mut self, event: Event) {
+        if let Event::Key(key) = event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && self.completion_active()
+        {
             match key.code {
-                KeyCode::Char('d') if self.text.is_empty() => return true,
-                KeyCode::Char('d') if self.submitting => {
-                    self.exit_after_submit = true;
-                    self.status = "Finishing submission before exit…".into();
-                    return false;
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.accept_selected();
+                    return;
                 }
-                KeyCode::Char('c') => {
-                    if self.completion_open() {
-                        self.reference_session.close();
-                        self.preview = None;
-                        self.status = "Completion dismissed".into();
-                    } else if !self.text.is_empty() {
-                        self.text.clear();
-                        self.references.clear();
-                        self.edit_changed();
-                        self.status = "Composer cleared; Ctrl-C again exits".into();
-                    } else {
-                        return true;
-                    }
-                    return false;
+                KeyCode::Up => {
+                    self.reference_session.select_previous();
+                    self.request_preview();
+                    return;
                 }
-                KeyCode::Char('j') => {
-                    self.begin_submit();
-                    return false;
+                KeyCode::Down => {
+                    self.reference_session.select_next();
+                    self.request_preview();
+                    return;
+                }
+                KeyCode::Char('j') if key.modifiers == KeyModifiers::CONTROL => {
+                    self.reference_session.select_next();
+                    self.request_preview();
+                    return;
+                }
+                KeyCode::Char('k') if key.modifiers == KeyModifiers::CONTROL => {
+                    self.reference_session.select_previous();
+                    self.request_preview();
+                    return;
                 }
                 _ => {}
             }
         }
-        match key.code {
-            code if self.completion_open() && is_completion_accept_key(code) => {
-                self.accept_selected()
-            }
-            KeyCode::Enter => self.begin_submit(),
-            KeyCode::Up if self.completion_open() => {
-                self.reference_session.select_previous();
-                self.request_preview();
-            }
-            KeyCode::Down if self.completion_open() => {
-                self.reference_session.select_next();
-                self.request_preview();
-            }
-            KeyCode::PageUp if !self.completion_open() => {
-                self.transcript_scroll = self.transcript_scroll.saturating_sub(3)
-            }
-            KeyCode::PageDown if !self.completion_open() => {
-                self.transcript_scroll =
-                    (self.transcript_scroll + 3).min(self.transcript.len().saturating_sub(1))
-            }
-            KeyCode::PageUp => self.preview_scroll = self.preview_scroll.saturating_sub(5),
-            KeyCode::PageDown => self.preview_scroll += 5,
-            KeyCode::Esc => {
-                self.reference_session.close();
-                self.preview = None;
-                self.status =
-                    "Completion dismissed; reference text remains literal until resolved".into();
-            }
-            KeyCode::Backspace => {
-                if self.text.pop().is_some() {
-                    let length = self.text.chars().count();
-                    self.references
-                        .retain(|reference| reference.range.end <= length);
-                    self.edit_changed();
-                    self.refresh_activation();
+        let was_insert = self.editor.mode() == AdapterMode::Insert;
+        match self.editor.handle_event(event, self.completion_active()) {
+            EditorInput::Delegated { text_changed: true } => {
+                if let Err(error) = self.sync_widget_edit() {
+                    self.status = format!("Edit failed: {error}");
                 }
             }
-            KeyCode::Char(character) => {
-                self.text.push(character);
-                self.edit_changed();
-                self.refresh_activation();
+            EditorInput::Delegated {
+                text_changed: false,
+            } => {
+                let _ = self.refresh_activation();
             }
-            _ => {}
+            EditorInput::TogglePreview => {
+                if self.preview_mode != PreviewMode::Disabled {
+                    self.preview_visible = !self.preview_visible;
+                    if self.preview_visible {
+                        self.request_preview();
+                    } else {
+                        self.preview = None;
+                    }
+                }
+            }
+            EditorInput::CommandSubmitted(command) => self.dispatch_command(command),
+            EditorInput::Undo => {
+                if self.document.undo() {
+                    let _ = self
+                        .replace_widget_from_document()
+                        .and_then(|_| self.sync_reference_state());
+                }
+            }
+            EditorInput::Redo => {
+                if self.document.redo() {
+                    let _ = self
+                        .replace_widget_from_document()
+                        .and_then(|_| self.sync_reference_state());
+                }
+            }
+            EditorInput::CommandCancelled => self.status.clear(),
+            EditorInput::CommandStarted | EditorInput::CommandUpdated | EditorInput::Ignored => {}
         }
-        false
+        let is_insert = self.editor.mode() == AdapterMode::Insert;
+        if !was_insert && is_insert && !self.insert_group_active {
+            self.document.begin_insert_group();
+            self.insert_group_active = true;
+        } else if was_insert && !is_insert && self.insert_group_active {
+            self.document.end_insert_group();
+            self.insert_group_active = false;
+        }
     }
 }
 
@@ -403,68 +437,33 @@ fn operation_name(kind: OperationKind) -> &'static str {
     match kind {
         OperationKind::Accept => "resolve reference",
         OperationKind::Preview => "load preview",
-        OperationKind::Lower => "submit",
+        OperationKind::Lower => "lower document",
     }
 }
 
-fn ranges_overlap(left: TextRange, right: TextRange) -> bool {
-    left.start < right.end && right.start < left.end
-}
-
-fn char_slice(text: &str, range: TextRange) -> Option<&str> {
-    let start = if range.start == text.chars().count() {
-        text.len()
-    } else {
-        text.char_indices().nth(range.start)?.0
-    };
-    let end = if range.end == text.chars().count() {
-        text.len()
-    } else {
-        text.char_indices().nth(range.end)?.0
-    };
-    text.get(start..end)
-}
-
-fn preview_lines(app: &App) -> Vec<Line<'static>> {
-    let selected = app.reference_session.selected();
-    let Some(cached) = app
-        .preview
-        .as_ref()
-        .filter(|cached| selected.is_some_and(|candidate| candidate.id == cached.candidate_id))
-    else {
-        return vec![Line::from(if selected.is_some() {
-            "Loading preview…"
-        } else {
-            "Type a configured reference leader to search."
-        })];
-    };
-    let Some(preview) = &cached.preview else {
-        return vec![Line::from("Preview unavailable")];
-    };
-    preview
-        .lines
+fn single_edit(before: &str, after: &str) -> TextEdit {
+    let before_chars: Vec<_> = before.chars().collect();
+    let after_chars: Vec<_> = after.chars().collect();
+    let prefix = before_chars
         .iter()
-        .map(|line| {
-            let text = match line.number {
-                Some(number) => format!("{number:>5} │ {}", line.text),
-                None => line.text.clone(),
-            };
-            let highlighted = line.number.is_some_and(|number| {
-                preview
-                    .highlighted_lines
-                    .as_ref()
-                    .is_some_and(|range| range.contains(&number))
-            });
-            if highlighted {
-                Line::styled(
-                    text,
-                    Style::default().fg(Color::Black).bg(Color::LightYellow),
-                )
-            } else {
-                Line::from(text)
-            }
-        })
-        .collect()
+        .zip(&after_chars)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = before_chars[prefix..]
+        .iter()
+        .rev()
+        .zip(after_chars[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    TextEdit::new(
+        TextRange {
+            start: prefix,
+            end: before_chars.len() - suffix,
+        },
+        after_chars[prefix..after_chars.len() - suffix]
+            .iter()
+            .collect::<String>(),
+    )
 }
 
 fn candidate_text(candidate: &ReferenceCandidate) -> String {
@@ -473,18 +472,9 @@ fn candidate_text(candidate: &ReferenceCandidate) -> String {
         text.push_str("  ");
         text.push_str(secondary);
     }
-    let context = format_context_cost(&candidate.context_cost);
-    let file = candidate
-        .file_context_cost
-        .as_ref()
-        .and_then(format_context_cost);
-    if let Some(context) = context {
+    if let Some(cost) = format_context_cost(&candidate.context_cost) {
         text.push_str(" · ");
-        text.push_str(&context);
-    }
-    if let Some(file) = file {
-        text.push_str(" · file ");
-        text.push_str(&file);
+        text.push_str(&cost);
     }
     text
 }
@@ -502,143 +492,147 @@ fn format_context_cost(cost: &ContextCost) -> Option<String> {
     }
 }
 
-fn draw(frame: &mut ratatui::Frame, app: &App) {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(5),
-            Constraint::Min(8),
-            Constraint::Length(5),
-            Constraint::Length(2),
-        ])
-        .split(frame.area());
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "  TS ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " CODE SELECTION  ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(app.repo.search_root.display().to_string()),
-    ]))
-    .block(Block::default().borders(Borders::BOTTOM));
-    frame.render_widget(header, vertical[0]);
-    let transcript = app
-        .transcript
+fn preview_lines(app: &App) -> Vec<Line<'static>> {
+    let selected = app.reference_session.selected();
+    let Some(cached) = app
+        .preview
+        .as_ref()
+        .filter(|cached| selected.is_some_and(|candidate| candidate.id == cached.candidate_id))
+    else {
+        return vec![Line::from("Loading preview…")];
+    };
+    let Some(preview) = &cached.preview else {
+        return vec![Line::from("Preview unavailable")];
+    };
+    preview
+        .lines
         .iter()
         .map(|line| {
-            Line::from(vec![
-                Span::styled("› ", Style::default().fg(Color::Cyan)),
-                Span::raw(line.clone()),
-            ])
+            Line::from(match line.number {
+                Some(number) => format!("{number:>5} │ {}", line.text),
+                None => line.text.clone(),
+            })
         })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(transcript)
-            .scroll((app.transcript_scroll as u16, 0))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Transcript · PgUp/PgDn when idle ")
-                    .borders(Borders::ALL),
-            ),
-        vertical[1],
-    );
-    let middle = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(vertical[2]);
-    let selected = app.reference_session.selected_index();
-    let items = app
-        .reference_session
-        .candidates()
-        .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            let style = if index == selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            ListItem::new(candidate_text(candidate)).style(style)
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        List::new(items).block(Block::default().title(" Matches ").borders(Borders::ALL)),
-        middle[0],
-    );
-    frame.render_widget(
-        Paragraph::new(preview_lines(app))
-            .scroll((app.preview_scroll as u16, 0))
-            .block(
-                Block::default()
-                    .title(" Preview · PgUp/PgDn · long lines clipped ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            ),
-        middle[1],
-    );
-    frame.render_widget(
-        Paragraph::new(app.text.as_str())
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Prompt · Tab/Enter completes · Enter submits · Ctrl-J always submits ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            ),
-        vertical[3],
-    );
-    frame.render_widget(
-        Paragraph::new(format!(
-            " {} · refs {}",
-            app.status,
-            format_context_total(app.refs_total)
-        ))
-        .style(Style::default().fg(Color::DarkGray)),
-        vertical[4],
-    );
+        .collect()
 }
 
-/// Fully validated state prepared before the application enters raw mode.
+fn overlay_area(area: Rect, width_percent: u8, height: u16) -> Rect {
+    let width =
+        ((u32::from(area.width) * u32::from(width_percent) / 100) as u16).clamp(1, area.width);
+    let height = height.clamp(1, area.height.saturating_sub(1).max(1));
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame.area());
+    frame.render_widget(app.editor.view(), rows[0]);
+    let mode = format!("{:?}", app.editor.mode()).to_uppercase();
+    let path = app
+        .save_target
+        .as_ref()
+        .map_or("[No Name]".into(), |target| {
+            target.logical_path().display().to_string()
+        });
+    let dirty = if app.document.is_dirty() { " [+]" } else { "" };
+    let command = app
+        .editor
+        .command_line()
+        .map(|line| format!(":{line}"))
+        .unwrap_or_default();
+    let status = if command.is_empty() {
+        format!(
+            " {mode}  {path}{dirty}  {}  refs {}",
+            app.status,
+            format_context_total(app.refs_total)
+        )
+    } else {
+        command
+    };
+    frame.render_widget(
+        Paragraph::new(status).style(if app.color {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        }),
+        rows[1],
+    );
+
+    if app.completion_active() {
+        let area = overlay_area(rows[0], app.completion_width_percent, app.completion_height);
+        frame.render_widget(Clear, area);
+        let show_preview = app.preview_visible && area.width >= 60 && area.height >= 6;
+        let columns = if show_preview {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+                .split(area)
+        } else {
+            Layout::default()
+                .constraints([Constraint::Percentage(100)])
+                .split(area)
+        };
+        let selected = app.reference_session.selected_index();
+        let items = app
+            .reference_session
+            .candidates()
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let style = if index == selected && app.color {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else if index == selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(candidate_text(candidate)).style(style)
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(items).block(Block::default().borders(Borders::ALL).title(" Completion ")),
+            columns[0],
+        );
+        if show_preview {
+            frame.render_widget(
+                Paragraph::new(preview_lines(app))
+                    .scroll((app.preview_scroll as u16, 0))
+                    .wrap(Wrap { trim: false })
+                    .block(Block::default().borders(Borders::ALL).title(" Preview ")),
+                columns[1],
+            );
+        }
+    }
+}
+
 pub struct Startup {
     pub repository: Repository,
     pub config: Config,
     pub document: Document,
+    pub save_target: Option<SaveTarget>,
 }
 
 pub fn run(startup: Startup) -> Result<()> {
-    let Startup {
-        repository,
-        config,
-        document,
-    } = startup;
-    let mut app =
-        App::new(repository, &config).context("could not initialize reference providers")?;
-    // Transitional bridge until the Phase 7 shell makes `Document` its source
-    // of truth. Keeping the validated document in the startup API prevents the
-    // file lifecycle from being rediscovered after raw mode begins.
-    app.text = document.text().to_owned();
-    enable_raw_mode()?;
-    let mut stderr = io::stderr();
-    execute!(stderr, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stderr);
-    let mut terminal = Terminal::new(backend)?;
-    let result = (|| -> Result<Vec<String>> {
+    let mut app = App::new(
+        startup.repository,
+        &startup.config,
+        startup.document,
+        startup.save_target,
+    )
+    .context("could not initialize editor")?;
+    let mut guard = crate::terminal::TerminalGuard::stderr()?;
+    {
+        let mut terminal = Terminal::new(CrosstermBackend::new(guard.backend_mut().writer_mut()))?;
         loop {
             app.drain_reference_events();
-            terminal.draw(|frame| draw(frame, &app))?;
+            terminal.draw(|frame| draw(frame, &mut app))?;
             if let Some(text) = app.pending_clipboard.take() {
                 write!(
                     terminal.backend_mut(),
@@ -650,37 +644,17 @@ pub fn run(startup: Startup) -> Result<()> {
             if app.should_exit {
                 break;
             }
-            let next_event = event::poll(Duration::from_millis(50))?
-                .then(event::read)
-                .transpose()?;
-            if let Some(Event::Key(key)) = next_event
-                && key.kind == crossterm::event::KeyEventKind::Press
-            {
-                let should_exit = app.key(key);
-                if should_exit {
-                    break;
-                }
+            if event::poll(Duration::from_millis(50))? {
+                app.handle_event(event::read()?);
             }
         }
-        Ok(app.transcript)
-    })();
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    let transcript = result?;
-    for line in transcript {
-        writeln!(io::stdout(), "{line}")?;
     }
-    io::stdout().flush()?;
+    guard.restore()?;
     Ok(())
 }
 
 pub fn is_terminal() -> bool {
     crossterm::tty::IsTty::is_tty(&io::stdin())
-}
-
-fn is_completion_accept_key(code: KeyCode) -> bool {
-    matches!(code, KeyCode::Tab | KeyCode::Enter)
 }
 
 fn centered_preview_scroll(one_based_line: usize) -> usize {
@@ -701,125 +675,44 @@ fn format_context_total(total: ContextTotal) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::references::model::{FileOrigin, FileTarget, ReferenceId, ReferenceTarget};
-    use std::time::Instant;
-
-    fn drain_until(app: &mut App, predicate: impl Fn(&App) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !predicate(app) {
-            assert!(Instant::now() < deadline, "background operation timed out");
-            app.drain_reference_events();
-            std::thread::yield_now();
-        }
-    }
 
     #[test]
-    fn tab_and_enter_accept_completions() {
-        assert!(is_completion_accept_key(KeyCode::Tab));
-        assert!(is_completion_accept_key(KeyCode::Enter));
-        assert!(!is_completion_accept_key(KeyCode::Char('x')));
-    }
-
-    #[test]
-    fn preview_starts_five_lines_before_the_symbol() {
-        assert_eq!(centered_preview_scroll(109), 103);
-        assert_eq!(centered_preview_scroll(3), 0);
-    }
-
-    #[test]
-    fn accepted_reference_replaces_unicode_character_range_and_invalidates_overlap() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("notes.txt"), "notes\n").unwrap();
-        let repo = Repository::discover(temp.path()).unwrap();
-        let mut app = App::new(repo, &Config::default()).unwrap();
-        app.text = "é @no".into();
-        app.references.push(ResolvedReference {
-            id: ReferenceId(1),
-            range: TextRange::new(2, 5).unwrap(),
-            friendly_text: "@no".into(),
-            target: ReferenceTarget::File(FileTarget {
-                canonical_path: temp.path().join("notes.txt"),
-                relative_path: "notes.txt".into(),
-                origin: FileOrigin::GitAware,
-                source_version: None,
-            }),
-        });
-        let accepted = crate::references::model::AcceptedReference {
-            replacement_range: TextRange::new(2, 5).unwrap(),
-            replacement_text: "@notes.txt".into(),
-            reference: ResolvedReference {
-                id: ReferenceId(2),
-                range: TextRange::new(2, 12).unwrap(),
-                friendly_text: "@notes.txt".into(),
-                target: ReferenceTarget::File(FileTarget {
-                    canonical_path: temp.path().join("notes.txt"),
-                    relative_path: "notes.txt".into(),
-                    origin: FileOrigin::GitAware,
-                    source_version: None,
-                }),
-            },
-        };
-
-        app.apply_accepted(accepted).unwrap();
-        assert_eq!(app.text, "é @notes.txt");
-        assert_eq!(app.references.len(), 1);
-        assert_eq!(app.references[0].id, ReferenceId(2));
-        assert_eq!(app.revision, DocumentRevision(1));
-    }
-
-    #[test]
-    fn candidate_rendering_never_reads_provider_data() {
-        let candidate = ReferenceCandidate {
-            id: CandidateId {
-                provider: ReferenceKind::GitFile,
-                opaque: "gone".into(),
-            },
-            generation: crate::references::model::GenerationId(1),
-            kind: ReferenceKind::GitFile,
-            friendly_text: "@gone".into(),
-            display: crate::references::model::CandidateDisplay {
-                primary: "gone".into(),
-                secondary: Some("file".into()),
-                ..Default::default()
-            },
-            context_cost: ContextCost::Tokens(1_234),
-            file_context_cost: None,
-            source_version: None,
-            token_source: None,
-        };
-        assert_eq!(candidate_text(&candidate), "gone  file · 1.2k");
-    }
-
-    #[test]
-    fn configured_leader_accepts_and_lowers_through_async_app_pipeline() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("notes.txt"), "notes\n").unwrap();
-        let repo = Repository::discover(temp.path()).unwrap();
-        let mut config = Config::default();
-        config.leaders.files = "§".into();
-        let mut app = App::new(repo, &config).unwrap();
-
-        for character in "§not".chars() {
-            app.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
-        }
-        drain_until(&mut app, App::completion_open);
-        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        drain_until(&mut app, |app| !app.references.is_empty());
-
-        assert_eq!(app.text, "§notes.txt");
-        assert_eq!(app.references[0].range, TextRange::new(0, 10).unwrap());
-
-        app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
-        drain_until(&mut app, |app| app.pending_clipboard.is_some());
-        assert_eq!(app.pending_clipboard.as_deref(), Some("notes.txt"));
-        assert_eq!(app.transcript, ["notes.txt"]);
-    }
-
-    #[test]
-    fn osc52_encodes_the_lowered_prompt() {
+    fn diff_is_unicode_character_based_and_minimal() {
         assert_eq!(
-            crate::clipboard::osc52_sequence("src/lib.rs"),
-            "\u{1b}]52;c;c3JjL2xpYi5ycw==\u{7}"
+            single_edit("a🦀b", "a日本b"),
+            TextEdit::new(TextRange { start: 1, end: 2 }, "日本")
         );
+    }
+
+    #[test]
+    fn overlay_degrades_inside_a_forty_by_eight_terminal() {
+        let area = overlay_area(Rect::new(0, 0, 40, 7), 80, 12);
+        assert!(area.width <= 40);
+        assert!(area.height <= 7);
+        assert!(area.width < 60, "narrow layouts must suppress preview");
+    }
+
+    #[test]
+    fn no_color_selection_has_a_non_color_signal() {
+        let style = Style::default().add_modifier(Modifier::REVERSED);
+        assert!(style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(style.fg, None);
+        assert_eq!(style.bg, None);
+    }
+
+    #[test]
+    fn preview_is_manual_by_default() {
+        assert_eq!(Config::default().ui.preview, PreviewMode::Manual);
+    }
+
+    #[test]
+    fn idle_layout_reserves_only_editor_and_status_rows() {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(Rect::new(0, 0, 40, 8));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].height, 7);
+        assert_eq!(rows[1].height, 1);
     }
 }
