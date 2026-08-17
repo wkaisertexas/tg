@@ -7,4 +7,5 @@ pub mod preview;
 pub mod references;
 pub mod repository;
 pub mod search;
+pub mod tokens;
 pub mod updater;
