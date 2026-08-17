@@ -1,6 +1,7 @@
 pub mod activation;
 pub mod file;
 pub mod github;
+pub mod jira;
 pub mod model;
 mod process;
 pub mod session;
