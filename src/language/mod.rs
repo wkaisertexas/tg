@@ -130,6 +130,8 @@ pub fn names_equivalent(left: &str, right: &str) -> bool {
 enum Flavor {
     C,
     Cpp,
+    Go,
+    Java,
     JavaScript,
     Rust,
     Python,
@@ -149,6 +151,8 @@ fn grammar(path: &Path) -> Option<(Language, Flavor)> {
         }
         "rs" => Some((tree_sitter_rust::LANGUAGE.into(), Flavor::Rust)),
         "py" | "pyi" => Some((tree_sitter_python::LANGUAGE.into(), Flavor::Python)),
+        "go" => Some((tree_sitter_go::LANGUAGE.into(), Flavor::Go)),
+        "java" => Some((tree_sitter_java::LANGUAGE.into(), Flavor::Java)),
         "js" | "mjs" | "cjs" | "jsx" => {
             Some((tree_sitter_javascript::LANGUAGE.into(), Flavor::JavaScript))
         }
@@ -398,19 +402,35 @@ fn classification(
         Flavor::JavaScript | Flavor::TypeScript | Flavor::Tsx
     );
     let is_typescript = matches!(flavor, Flavor::TypeScript | Flavor::Tsx);
+    let is_go = matches!(flavor, Flavor::Go);
+    let is_java = matches!(flavor, Flavor::Java);
     let result = match kind {
         "namespace_definition" | "mod_item" => ("module", "name"),
         "internal_module" | "module" if is_typescript => ("module", "name"),
         "class_definition" => ("class", "name"),
         "class_declaration" if is_ecmascript => ("class", "name"),
+        "class_declaration" if is_java => ("class", "name"),
         "class" if is_ecmascript && node.child_by_field_name("name").is_some() => ("class", "name"),
         "abstract_class_declaration" if is_typescript => ("class", "name"),
         "interface_declaration" if is_typescript => ("interface", "name"),
+        "interface_declaration" if is_java => ("interface", "name"),
+        "record_declaration" if is_java => ("record", "name"),
+        "annotation_type_declaration" if is_java => ("annotation", "name"),
         "class_specifier" => ("class", "name"),
         "struct_specifier" | "struct_item" => ("struct", "name"),
         "union_specifier" | "union_item" => ("union", "name"),
         "enum_specifier" | "enum_item" => ("enum", "name"),
         "enum_declaration" if is_typescript => ("enum", "name"),
+        "enum_declaration" if is_java => ("enum", "name"),
+        "type_spec" if is_go => {
+            let symbol_kind = match node.child_by_field_name("type").map(|node| node.kind()) {
+                Some("struct_type") => "struct",
+                Some("interface_type") => "interface",
+                _ => "type",
+            };
+            (symbol_kind, "name")
+        }
+        "type_alias" if is_go => ("type alias", "name"),
         "trait_item" => ("trait", "name"),
         "type_item" | "type_definition" | "alias_declaration" => ("type alias", "name"),
         "type_alias_declaration" if is_typescript => ("type alias", "name"),
@@ -428,10 +448,15 @@ fn classification(
         "function_signature" if is_typescript => {
             (if inside_type { "method" } else { "function" }, "name")
         }
+        "function_declaration" if is_go => ("function", "name"),
+        "method_declaration" if is_go || is_java => ("method", "name"),
+        "method_elem" if is_go => ("method", "name"),
+        "annotation_type_element_declaration" if is_java => ("method", "name"),
         "method_definition" if is_ecmascript => ("method", "name"),
         "method_signature" | "abstract_method_signature" if is_typescript => ("method", "name"),
         "enumerator" | "enum_variant" => ("enum member", "name"),
         "enum_assignment" if is_typescript => ("enum member", "name"),
+        "enum_constant" if is_java => ("enum member", "name"),
         "property_identifier"
             if is_typescript
                 && node
@@ -440,18 +465,68 @@ fn classification(
         {
             ("enum member", "name")
         }
-        "field_declaration" => ("field", "declarator"),
+        "field_declaration" if !is_java && !is_go => ("field", "declarator"),
+        "field_identifier" | "type_identifier" if is_go && is_go_field_name(node) => {
+            ("field", "name")
+        }
+        "identifier" if is_go && go_package_binding_kind(node).is_some() => (
+            go_package_binding_kind(node).expect("binding kind checked above"),
+            "name",
+        ),
         "field_definition" if is_ecmascript => ("field", "property"),
         "public_field_definition" | "property_signature" if is_typescript => ("field", "name"),
         "variable_declarator" if is_ecmascript && is_callable_variable(node) => {
             ("function", "name")
         }
+        "variable_declarator" if is_java && is_java_field_declarator(node) => ("field", "name"),
+        "formal_parameter" if is_java && is_java_record_component(node) => ("field", "name"),
         _ => return None,
     };
     if matches!(flavor, Flavor::Python) && kind == "function_definition" {
         return Some((if inside_type { "method" } else { "function" }, "name"));
     }
     Some(result)
+}
+
+fn is_java_field_declarator(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| matches!(parent.kind(), "field_declaration" | "constant_declaration"))
+}
+
+fn is_java_record_component(node: Node<'_>) -> bool {
+    node.parent()
+        .and_then(|parent| parent.parent())
+        .is_some_and(|grandparent| grandparent.kind() == "record_declaration")
+}
+
+fn is_go_field_name(node: Node<'_>) -> bool {
+    let Some(parent) = node
+        .parent()
+        .filter(|parent| parent.kind() == "field_declaration")
+    else {
+        return false;
+    };
+    node.kind() == "field_identifier"
+        || (node.kind() == "type_identifier" && parent.child_by_field_name("name").is_none())
+}
+
+fn go_package_binding_kind(node: Node<'_>) -> Option<&'static str> {
+    let spec = node.parent()?;
+    let kind = match spec.kind() {
+        "const_spec" => "constant",
+        "var_spec" => "variable",
+        _ => return None,
+    };
+    let declaration = spec.parent()?;
+    if !matches!(declaration.kind(), "const_declaration" | "var_declaration")
+        || declaration.parent()?.kind() != "source_file"
+    {
+        return None;
+    }
+    let mut cursor = spec.walk();
+    spec.children_by_field_name("name", &mut cursor)
+        .any(|name| name == node)
+        .then_some(kind)
 }
 
 fn is_callable_variable(node: Node<'_>) -> bool {
@@ -542,6 +617,8 @@ fn scope_kind(kind: &str) -> Option<ScopeKind> {
         | "class_declaration"
         | "abstract_class_declaration"
         | "interface_declaration"
+        | "record_declaration"
+        | "annotation_type_declaration"
         | "struct_specifier"
         | "struct_item"
         | "union_specifier"
@@ -549,6 +626,7 @@ fn scope_kind(kind: &str) -> Option<ScopeKind> {
         | "enum_specifier"
         | "enum_item"
         | "enum_declaration"
+        | "enum_constant"
         | "trait_item" => Some(ScopeKind::Type),
         _ => None,
     }
@@ -592,6 +670,16 @@ fn visit(
         .last()
         .is_some_and(|scope| scope.kind == ScopeKind::Type);
     let original_scope_len = scopes.len();
+    if matches!(flavor, Flavor::Go)
+        && node.kind() == "method_declaration"
+        && let Some(name_node) = go_receiver_name(node)
+        && let Ok(name) = name_node.utf8_text(source)
+    {
+        scopes.push(Scope {
+            name: name.to_owned(),
+            kind: ScopeKind::Type,
+        });
+    }
     if node.kind() == "impl_item"
         && let Some(type_node) = node.child_by_field_name("type").and_then(unwrap_identifier)
         && let Ok(name) = type_node.utf8_text(source)
@@ -607,6 +695,13 @@ fn visit(
         && !name.is_empty()
         && !(node.kind() == "method_definition" && name == "constructor")
     {
+        let declaration_node = if matches!(flavor, Flavor::Go) && is_go_field_name(node) {
+            node.parent().expect("Go field parent checked above")
+        } else if matches!(flavor, Flavor::Go) && go_package_binding_kind(node).is_some() {
+            node.parent().expect("Go binding parent checked above")
+        } else {
+            node
+        };
         let qualified_name = if scopes.is_empty() {
             name.to_owned()
         } else {
@@ -626,11 +721,11 @@ fn visit(
             start: name_node.start_position().into(),
             name_start_byte: name_node.start_byte(),
             name_end_byte: name_node.end_byte(),
-            range_start_byte: node.start_byte(),
-            range_end_byte: node.end_byte(),
+            range_start_byte: declaration_node.start_byte(),
+            range_end_byte: declaration_node.end_byte(),
             is_definition: is_definition(node),
         });
-        if let Some(kind) = scope_kind(node.kind()) {
+        if let Some(kind) = scope_kind(node.kind()).or_else(|| language_scope_kind(node, flavor)) {
             scopes.push(Scope {
                 name: name.to_owned(),
                 kind,
@@ -648,6 +743,34 @@ fn visit(
     scopes.truncate(original_scope_len);
 }
 
+fn language_scope_kind(node: Node<'_>, flavor: Flavor) -> Option<ScopeKind> {
+    (matches!(flavor, Flavor::Go)
+        && node.kind() == "type_spec"
+        && node
+            .child_by_field_name("type")
+            .is_some_and(|node| matches!(node.kind(), "struct_type" | "interface_type")))
+    .then_some(ScopeKind::Type)
+}
+
+fn go_receiver_name(node: Node<'_>) -> Option<Node<'_>> {
+    fn find_type_identifier(node: Node<'_>) -> Option<Node<'_>> {
+        if node.kind() == "type_identifier" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find_map(find_type_identifier)
+    }
+
+    let receiver = node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    receiver.named_children(&mut cursor).find_map(|parameter| {
+        parameter
+            .child_by_field_name("type")
+            .and_then(find_type_identifier)
+    })
+}
+
 fn is_callable(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -659,6 +782,11 @@ fn is_callable(node: Node<'_>) -> bool {
             | "generator_function"
             | "arrow_function"
             | "function_signature"
+            | "method_declaration"
+            | "method_elem"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "annotation_type_element_declaration"
             | "method_definition"
             | "method_signature"
             | "abstract_method_signature"
@@ -672,12 +800,15 @@ fn is_definition(node: Node<'_>) -> bool {
         | "union_specifier"
         | "enum_specifier"
         | "function_signature"
+        | "method_elem"
+        | "annotation_type_element_declaration"
         | "method_signature"
         | "abstract_method_signature"
         | "property_signature" => false,
-        "function_declaration" | "generator_function_declaration" | "method_definition" => {
-            node.child_by_field_name("body").is_some()
-        }
+        "function_declaration"
+        | "generator_function_declaration"
+        | "method_definition"
+        | "method_declaration" => node.child_by_field_name("body").is_some(),
         _ => true,
     }
 }

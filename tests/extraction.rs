@@ -301,3 +301,208 @@ fn malformed_tsx_retains_usable_symbols() {
         assert!(symbol.name_start_byte < symbol.name_end_byte);
     }
 }
+
+#[test]
+fn detects_go_and_java_sources_and_conventional_java_filenames() {
+    for name in [
+        "sample.go",
+        "Sample.java",
+        "module-info.java",
+        "package-info.java",
+    ] {
+        assert!(
+            tscodeselection::language::supports(Path::new(name)),
+            "{name}"
+        );
+    }
+    assert!(!tscodeselection::language::supports(Path::new("go.mod")));
+    assert!(!tscodeselection::language::supports(Path::new(
+        "Sample.class"
+    )));
+}
+
+#[test]
+fn extracts_go_types_methods_interfaces_and_unicode_ranges() {
+    let parsed = tscodeselection::language::parse(&language_fixture("sample.go"))
+        .unwrap()
+        .unwrap();
+    let symbol = |qualified: &str| {
+        parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == qualified)
+            .unwrap_or_else(|| panic!("missing {qualified}"))
+    };
+
+    assert_eq!(symbol("Service").kind, "struct");
+    assert_eq!(symbol("Service::Name").kind, "field");
+    assert_eq!(symbol("Service::Count").kind, "field");
+    assert_eq!(symbol("Service::Total").kind, "field");
+    assert_eq!(symbol("Service::Embedded").kind, "field");
+    assert_eq!(symbol("Default").kind, "constant");
+    assert_eq!(symbol("Alternate").kind, "constant");
+    assert_eq!(symbol("Current").kind, "variable");
+    assert_eq!(symbol("Reader").kind, "interface");
+    assert_eq!(symbol("Reader::Read").kind, "method");
+    assert!(!symbol("Reader::Read").is_definition);
+    assert_eq!(symbol("Alias").kind, "type alias");
+    assert_eq!(symbol("Identifier").kind, "type");
+    assert_eq!(symbol("Service::Save").kind, "method");
+    assert_eq!(symbol("Service::Render").kind, "method");
+    assert_eq!(symbol("Render").kind, "function");
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| matches!(symbol.leaf_name.as_str(), "local" | "Hidden"))
+    );
+
+    let cafe = symbol("Café");
+    assert_eq!(
+        &parsed.source[cafe.name_start_byte..cafe.name_end_byte],
+        "Café"
+    );
+    assert_eq!(symbol("Café::Crème").kind, "field");
+    let members = tscodeselection::language::find_symbols(&parsed.symbols, "Service.");
+    assert!(members.iter().any(|symbol| symbol.leaf_name == "Render"));
+    assert_eq!(
+        parsed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.leaf_name == "Render")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn extracts_java_nested_types_fields_signatures_and_records() {
+    let parsed = tscodeselection::language::parse(&language_fixture("Sample.java"))
+        .unwrap()
+        .unwrap();
+    let symbol = |qualified: &str| {
+        parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == qualified)
+            .unwrap_or_else(|| panic!("missing {qualified}"))
+    };
+
+    assert_eq!(symbol("Service").kind, "class");
+    assert_eq!(symbol("Service::name").kind, "field");
+    assert_eq!(symbol("Service::alias").kind, "field");
+    assert_eq!(symbol("Service::render").kind, "method");
+    assert_eq!(symbol("Service::Inner").kind, "class");
+    assert_eq!(symbol("Service::Inner::render").kind, "method");
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.leaf_name == "Hidden")
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.leaf_name == "local")
+    );
+    assert_eq!(symbol("Reader").kind, "interface");
+    assert!(!symbol("Reader::read").is_definition);
+    assert!(symbol("Reader::close").is_definition);
+    assert_eq!(symbol("State::READY").kind, "enum member");
+    assert_eq!(symbol("State::NAMED").kind, "enum member");
+    assert_eq!(symbol("Result").kind, "record");
+    assert_eq!(symbol("Result::value").kind, "field");
+    assert_eq!(symbol("Result::unwrap").kind, "method");
+    assert_eq!(symbol("Marker").kind, "annotation");
+    assert!(!symbol("Marker::value").is_definition);
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.leaf_name == "Service" && symbol.kind == "method")
+    );
+
+    let cafe = symbol("Café");
+    assert_eq!(
+        &parsed.source[cafe.name_start_byte..cafe.name_end_byte],
+        "Café"
+    );
+    assert_eq!(symbol("Café::crème").kind, "field");
+    assert_eq!(
+        parsed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.leaf_name == "render")
+            .count(),
+        2
+    );
+    let members = tscodeselection::language::find_symbols(&parsed.symbols, "Service.");
+    assert!(members.iter().any(|symbol| symbol.leaf_name == "save"));
+}
+
+#[test]
+fn switches_between_go_and_java_parsers_in_both_directions() {
+    let go_source = fs::read_to_string(language_fixture("sample.go")).unwrap();
+    let java_source = fs::read_to_string(language_fixture("Sample.java")).unwrap();
+    let mut parser = tscodeselection::language::SymbolParser::new();
+    let go = parser
+        .parse_source(Path::new("first.go"), go_source.clone())
+        .unwrap()
+        .unwrap();
+    assert!(
+        go.symbols
+            .iter()
+            .any(|symbol| symbol.leaf_name == "Service")
+    );
+    let java = parser
+        .parse_source(Path::new("Second.java"), java_source.clone())
+        .unwrap()
+        .unwrap();
+    assert!(
+        java.symbols
+            .iter()
+            .any(|symbol| symbol.leaf_name == "Reader")
+    );
+
+    let mut reverse = tscodeselection::language::SymbolParser::new();
+    reverse
+        .parse_source(Path::new("First.java"), java_source)
+        .unwrap()
+        .unwrap();
+    let reparsed_go = reverse
+        .parse_source(Path::new("second.go"), go_source)
+        .unwrap()
+        .unwrap();
+    assert!(
+        reparsed_go
+            .symbols
+            .iter()
+            .any(|symbol| symbol.leaf_name == "Alias")
+    );
+}
+
+#[test]
+fn malformed_go_and_java_retain_usable_symbols_and_valid_ranges() {
+    for fixture in ["malformed.go", "Malformed.java"] {
+        let parsed = tscodeselection::language::parse(&language_fixture(fixture))
+            .unwrap()
+            .unwrap();
+        for expected in ["Before", "Broken"] {
+            assert!(
+                parsed
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.leaf_name == expected),
+                "{fixture}: missing {expected}"
+            );
+        }
+        for symbol in &parsed.symbols {
+            assert!(parsed.source.is_char_boundary(symbol.name_start_byte));
+            assert!(parsed.source.is_char_boundary(symbol.name_end_byte));
+            assert!(symbol.name_start_byte < symbol.name_end_byte);
+            assert!(symbol.range_start_byte <= symbol.name_start_byte);
+            assert!(symbol.name_end_byte <= symbol.range_end_byte);
+        }
+    }
+}
