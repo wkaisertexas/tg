@@ -53,8 +53,9 @@ pub struct QueryRequest {
 pub enum QueryScope {
     Repository,
     File {
-        canonical_path: PathBuf,
-        relative_path: String,
+        /// Unresolved path joined to the search root. Providers canonicalize
+        /// and contain it on their background worker.
+        path: PathBuf,
         origin: FileOrigin,
     },
 }

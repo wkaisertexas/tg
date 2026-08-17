@@ -166,21 +166,26 @@ impl SymbolProvider {
         &self,
         request: &QueryRequest,
         path: &Path,
-        relative: &str,
+        origin: FileOrigin,
     ) -> Result<Vec<ReferenceCandidate>> {
         let Some((parsed, version)) = self.parse(path)? else {
             bail!("symbol completion is unavailable for this file")
         };
         let canonical_path = path.canonicalize()?;
+        let relative = canonical_path
+            .strip_prefix(&self.canonical_root)
+            .context("file is outside search root")?
+            .to_string_lossy()
+            .replace('\\', "/");
         Ok(language::find_symbols(&parsed.symbols, &request.query)
             .into_iter()
             .take(request.limit)
             .map(|symbol| IndexedSymbol {
-                relative_path: relative.replace('\\', "/"),
+                relative_path: relative.clone(),
                 canonical_path: canonical_path.clone(),
                 source_version: version.clone(),
                 symbol: symbol.clone(),
-                origin: FileOrigin::Broad,
+                origin,
             })
             .map(|entry| self.candidate(&entry, request.generation, &request.typed_leader))
             .collect())
@@ -345,18 +350,8 @@ impl ReferenceProvider for SymbolProvider {
             return Ok(());
         }
         match &request.scope {
-            QueryScope::File {
-                canonical_path,
-                relative_path,
-                origin,
-            } => {
-                let mut candidates = self.file_query(&request, canonical_path, relative_path)?;
-                for candidate in &mut candidates {
-                    if let Some(target) = self.targets.lock().unwrap().get_mut(&candidate.id.opaque)
-                    {
-                        target.file.origin = *origin;
-                    }
-                }
+            QueryScope::File { path, origin } => {
+                let candidates = self.file_query(&request, path, *origin)?;
                 emit(QueryEmission {
                     generation: request.generation,
                     candidates,
@@ -580,9 +575,9 @@ mod tests {
     }
 
     fn file_scope(path: &Path, relative: &str) -> QueryScope {
+        let _ = relative;
         QueryScope::File {
-            canonical_path: path.canonicalize().unwrap(),
-            relative_path: relative.into(),
+            path: path.to_path_buf(),
             origin: FileOrigin::GitAware,
         }
     }
