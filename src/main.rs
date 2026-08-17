@@ -16,11 +16,21 @@ fn real_main() -> Result<()> {
         return tscodeselection::updater::update();
     }
 
-    let root_folder = cli
-        .root(std::env::var_os("TG_ROOT").as_deref())
-        .context("a root folder is required; pass --root DIRECTORY")?;
-    let repository = tscodeselection::repository::Repository::discover(&root_folder)?;
     let cwd = std::env::current_dir().context("cannot determine current working directory")?;
+    // File validation deliberately precedes terminal setup. Invalid UTF-8,
+    // directories, and missing parents therefore cannot leave raw mode active.
+    let document = match cli.file() {
+        Some(path) => tscodeselection::editor::Document::open(path)
+            .with_context(|| format!("could not open document {}", path.display()))?,
+        None => tscodeselection::editor::Document::unnamed(),
+    };
+    let environment_root = std::env::var_os("TG_ROOT");
+    let repository = tscodeselection::repository::Repository::for_editor(
+        cli.explicit_root(),
+        environment_root.as_deref().map(std::path::Path::new),
+        &cwd,
+        cli.file(),
+    )?;
     let config_inputs = cli.config_inputs(&cwd, &repository.search_root);
     let loaded_config =
         tscodeselection::config::load(&config_inputs).context("could not load configuration")?;
@@ -35,5 +45,9 @@ fn real_main() -> Result<()> {
         tscodeselection::app::is_terminal(),
         "interactive mode requires a terminal; use --resolve for headless operation"
     );
-    tscodeselection::app::run(repository, loaded_config.config)
+    tscodeselection::app::run(tscodeselection::app::Startup {
+        repository,
+        config: loaded_config.config,
+        document,
+    })
 }

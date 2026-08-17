@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use tscodeselection::config::{CliConfigOverrides, ConfigInputs};
 
@@ -20,12 +20,12 @@ const CONFIG_ENVIRONMENT: &[&str] = &[
 #[command(
     version,
     about = "Compose coding-agent prompts with structured references",
-    long_about = "Compose coding-agent prompts with structured references.\n\nThe positional ROOT_FOLDER form is retained for v0.1 compatibility; prefer --root."
+    long_about = "Edit coding-agent prompts with structured references.\n\nFILE may be an existing UTF-8 file or a new file whose parent directory exists."
 )]
 pub(crate) struct Cli {
-    /// Legacy search root (prefer --root; becomes FILE in the prompt editor).
-    #[arg(value_name = "ROOT_FOLDER", conflicts_with = "root")]
-    legacy_root: Option<PathBuf>,
+    /// File to edit. Omit for an unnamed buffer.
+    #[arg(value_name = "FILE")]
+    file: Option<PathBuf>,
 
     /// Directory inside the project to search.
     #[arg(long, value_name = "DIRECTORY")]
@@ -74,11 +74,12 @@ impl Cli {
         matches!(self.command, Some(Command::Update))
     }
 
-    pub(crate) fn root(&self, tg_root: Option<&OsStr>) -> Option<PathBuf> {
-        self.root
-            .clone()
-            .or_else(|| tg_root.map(PathBuf::from))
-            .or_else(|| self.legacy_root.clone())
+    pub(crate) fn file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+
+    pub(crate) fn explicit_root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     pub(crate) fn config_inputs(&self, cwd: &Path, repository_root: &Path) -> ConfigInputs {
@@ -107,22 +108,16 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn root_precedence_is_cli_then_environment_then_legacy() {
-        let cli = Cli::try_parse_from(["tg", "legacy", "--root", "explicit"]);
-        assert!(cli.is_err(), "positional and --root must conflict");
+    fn positional_file_and_explicit_root_are_independent() {
+        let cli = Cli::try_parse_from(["tg", "prompt.md", "--root", "project"]).unwrap();
+        assert_eq!(cli.file(), Some(Path::new("prompt.md")));
+        assert_eq!(cli.explicit_root(), Some(Path::new("project")));
 
-        let cli = Cli::try_parse_from(["tg", "--root", "explicit"]).unwrap();
-        assert_eq!(
-            cli.root(Some(OsStr::new("environment"))),
-            Some(PathBuf::from("explicit"))
-        );
+        let unnamed = Cli::try_parse_from(["tg", "--root", "project"]).unwrap();
+        assert!(unnamed.file().is_none());
 
-        let cli = Cli::try_parse_from(["tg", "legacy"]).unwrap();
-        assert_eq!(
-            cli.root(Some(OsStr::new("environment"))),
-            Some(PathBuf::from("environment"))
-        );
-        assert_eq!(cli.root(None), Some(PathBuf::from("legacy")));
+        let update = Cli::try_parse_from(["tg", "update"]).unwrap();
+        assert!(update.requests_update(), "update must remain a subcommand");
     }
 
     #[test]

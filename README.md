@@ -26,11 +26,12 @@ just check
 ## Install and run
 ```sh
 curl -fsSL https://raw.githubusercontent.com/wkaisertexas/tg/main/install.sh | sh
-tg .
-cargo run --release --bin tg -- <root-folder>
+tg README.md
+tg --root .
+cargo run --release --bin tg -- [file]
 ```
 
 Type `@`/`%` for files or standalone `::` for repository symbols; append `.` for members.
 `Tab` or Enter. Enter submits when completion is closed; `Ctrl-J` always submits. `Esc`
 dismisses; `Ctrl-C` cancels/clears/exits; `Ctrl-D` exits empty. For automation, add
-`--resolve 'Inspect @src/lib.rs::Symbol'` after the root folder. Upgrade with `tg update`.
+`--resolve 'Inspect @src/lib.rs::Symbol'` with `--root` when needed. Upgrade with `tg update`.

@@ -14,7 +14,6 @@ fn terminal_binary_accepts_a_prompt_and_restores_the_screen() {
         })
         .unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tg"));
-    command.arg(temp.path());
     command.cwd(temp.path());
     command.env("TERM", "xterm-256color");
     command.env("HOME", temp.path());

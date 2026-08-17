@@ -1,4 +1,5 @@
 use crate::config::{Config, LeadersConfig};
+use crate::editor::Document;
 use crate::references::ThreadExecutor;
 use crate::references::activation::{CharReplacement, apply_char_replacements, detect_activation};
 use crate::references::file::FileProvider;
@@ -610,8 +611,25 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     );
 }
 
-pub fn run(repo: Repository, config: Config) -> Result<()> {
-    let mut app = App::new(repo, &config).context("could not initialize reference providers")?;
+/// Fully validated state prepared before the application enters raw mode.
+pub struct Startup {
+    pub repository: Repository,
+    pub config: Config,
+    pub document: Document,
+}
+
+pub fn run(startup: Startup) -> Result<()> {
+    let Startup {
+        repository,
+        config,
+        document,
+    } = startup;
+    let mut app =
+        App::new(repository, &config).context("could not initialize reference providers")?;
+    // Transitional bridge until the Phase 7 shell makes `Document` its source
+    // of truth. Keeping the validated document in the startup API prevents the
+    // file lifecycle from being rediscovered after raw mode begins.
+    app.text = document.text().to_owned();
     enable_raw_mode()?;
     let mut stderr = io::stderr();
     execute!(stderr, EnterAlternateScreen)?;

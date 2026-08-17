@@ -46,7 +46,7 @@ fn every_documented_invocation_resolves_end_to_end() {
         isolate_config(&mut command, home.path());
         let output = command
             .current_dir(root)
-            .args([".", "--resolve", &case.submitted_prompt])
+            .args(["--root", ".", "--resolve", &case.submitted_prompt])
             .output()
             .unwrap();
         assert!(

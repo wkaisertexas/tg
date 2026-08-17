@@ -34,7 +34,7 @@ fn create_root(path: &Path) {
 }
 
 #[test]
-fn help_documents_the_phase_one_surface() {
+fn help_documents_the_prompt_editor_surface() {
     let temp = tempfile::tempdir().unwrap();
     let output = command(temp.path()).arg("--help").output().unwrap();
     assert!(output.status.success());
@@ -47,7 +47,7 @@ fn help_documents_the_phase_one_surface() {
         "--no-preview",
         "--no-color",
         "update",
-        "ROOT_FOLDER",
+        "FILE",
     ] {
         assert!(
             stdout.contains(expected),
@@ -57,45 +57,42 @@ fn help_documents_the_phase_one_surface() {
 }
 
 #[test]
-fn legacy_and_explicit_root_resolve_identically() {
+fn cwd_discovery_and_explicit_root_resolve_identically_with_a_positional_file() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
     let home = temp.path().join("home");
     create_root(&root);
+    fs::write(root.join("prompt.md"), "prompt\n").unwrap();
     fs::create_dir(&home).unwrap();
     let root_text = root.to_str().unwrap();
 
-    let legacy = resolve(&mut command(&home), &[root_text]);
+    let implicit = resolve(command(&home).current_dir(&root), &["prompt.md"]);
     let explicit = resolve(&mut command(&home), &["--root", root_text]);
     assert!(
-        legacy.status.success(),
+        implicit.status.success(),
         "{}",
-        String::from_utf8_lossy(&legacy.stderr)
+        String::from_utf8_lossy(&implicit.stderr)
     );
     assert!(
         explicit.status.success(),
         "{}",
         String::from_utf8_lossy(&explicit.stderr)
     );
-    assert_eq!(legacy.stdout, explicit.stdout);
-    assert_eq!(legacy.stdout, b"Read selected.txt\n");
+    assert_eq!(implicit.stdout, explicit.stdout);
+    assert_eq!(implicit.stdout, b"Read selected.txt\n");
 }
 
 #[test]
-fn root_precedence_is_cli_then_tg_root_then_legacy() {
+fn root_precedence_is_cli_then_tg_root() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let cli_root = temp.path().join("cli");
     let env_root = temp.path().join("environment");
-    let legacy_root = temp.path().join("legacy-missing");
     fs::create_dir(&home).unwrap();
     create_root(&cli_root);
     create_root(&env_root);
 
-    let output = resolve(
-        command(&home).env("TG_ROOT", &env_root),
-        &[legacy_root.to_str().unwrap()],
-    );
+    let output = resolve(command(&home).env("TG_ROOT", &env_root), &[]);
     assert!(
         output.status.success(),
         "{}",
@@ -114,14 +111,32 @@ fn root_precedence_is_cli_then_tg_root_then_legacy() {
 }
 
 #[test]
-fn positional_and_explicit_root_are_rejected_together() {
+fn positional_file_and_explicit_root_are_allowed_but_directories_are_rejected() {
     let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("prompt.md");
+    fs::write(&file, "prompt").unwrap();
     let output = command(temp.path())
-        .args(["legacy", "--root", "explicit", "--resolve", "plain"])
+        .args([
+            file.to_str().unwrap(),
+            "--root",
+            temp.path().to_str().unwrap(),
+            "--resolve",
+            "plain",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = command(temp.path())
+        .args([temp.path().to_str().unwrap(), "--resolve", "plain"])
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not a regular file"));
 }
 
 #[test]
