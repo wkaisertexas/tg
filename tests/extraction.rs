@@ -7,6 +7,129 @@ fn language_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn assert_valid_symbol_ranges(parsed: &tscodeselection::language::ParsedFile) {
+    for symbol in &parsed.symbols {
+        assert!(parsed.source.is_char_boundary(symbol.name_start_byte));
+        assert!(parsed.source.is_char_boundary(symbol.name_end_byte));
+        assert!(parsed.source.is_char_boundary(symbol.range_start_byte));
+        assert!(parsed.source.is_char_boundary(symbol.range_end_byte));
+        assert!(symbol.name_start_byte < symbol.name_end_byte);
+        assert!(symbol.range_start_byte <= symbol.name_start_byte);
+        assert!(symbol.name_end_byte <= symbol.range_end_byte);
+    }
+}
+
+#[test]
+fn core_language_fixtures_cover_nested_duplicate_and_excluded_local_symbols() {
+    let cases = [
+        ("core.c", "Outer::Nested", "duplicate", &["local"][..]),
+        ("core.cpp", "Outer::Nested", "duplicate", &["local"][..]),
+        (
+            "core.py",
+            "Outer::Nested",
+            "duplicate",
+            &["local", "Hidden", "inner"][..],
+        ),
+        (
+            "core.rs",
+            "outer::Nested",
+            "duplicate",
+            &["Hidden", "local"][..],
+        ),
+        (
+            "Sample.java",
+            "Service::Inner",
+            "render",
+            &["Hidden", "local"][..],
+        ),
+        (
+            "Sample.cs",
+            "Acme::Tools::Service::Inner",
+            "Render",
+            &["Hidden", "Local"][..],
+        ),
+        (
+            "sample.rb",
+            "Acme::Service",
+            "save",
+            &["hidden", "local", "INNER"][..],
+        ),
+        (
+            "javascript.js",
+            "View::render",
+            "render",
+            &["nested", "local", "hidden", "value"][..],
+        ),
+        (
+            "core.md",
+            "Outer::Nested",
+            "Duplicate",
+            &["Hidden", "Still hidden"][..],
+        ),
+    ];
+
+    for (fixture, nested, duplicate, excluded) in cases {
+        let parsed = tscodeselection::language::parse(&language_fixture(fixture))
+            .unwrap()
+            .unwrap();
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|symbol| symbol.qualified_name == nested),
+            "{fixture}: missing nested symbol {nested}"
+        );
+        assert_eq!(
+            parsed
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.leaf_name == duplicate)
+                .count(),
+            2,
+            "{fixture}: expected duplicate symbol {duplicate}"
+        );
+        for excluded in excluded {
+            assert!(
+                !parsed
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.leaf_name == *excluded),
+                "{fixture}: unexpected local symbol {excluded}"
+            );
+        }
+        assert_valid_symbol_ranges(&parsed);
+    }
+}
+
+#[test]
+fn malformed_core_language_fixtures_retain_symbols_and_valid_ranges() {
+    let cases = [
+        ("malformed.c", &["before", "Broken"][..]),
+        ("malformed.cpp", &["before", "Broken"][..]),
+        ("malformed.py", &["before", "Broken"][..]),
+        ("malformed.rs", &["before", "Broken"][..]),
+        ("Malformed.java", &["Before", "Broken"][..]),
+        ("malformed.js", &["before", "Broken"][..]),
+        ("malformed.md", &["Before", "Broken"][..]),
+    ];
+
+    for (fixture, expected) in cases {
+        let parsed = tscodeselection::language::parse(&language_fixture(fixture))
+            .unwrap()
+            .unwrap();
+        for expected in expected {
+            assert!(
+                parsed
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.leaf_name == *expected),
+                "{fixture}: missing {expected}"
+            );
+        }
+        assert_valid_symbol_ranges(&parsed);
+    }
+}
+
 #[test]
 fn extracts_declarations_from_all_supported_languages() {
     let temp = tempfile::tempdir().unwrap();

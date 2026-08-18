@@ -31,6 +31,9 @@ end
 def Widget.create
 end
 
+def Widget.save
+end
+
 TOP_LEVEL = 5
 Admin::EXPLICIT = 6
 

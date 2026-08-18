@@ -17,6 +17,7 @@ public class Service
         void Hidden() { }
         class Local { }
     }
+    public void Render(string value) { }
     public abstract void Missing();
     public class Inner
     {
