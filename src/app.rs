@@ -23,7 +23,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -768,6 +768,63 @@ fn config_help_lines(config: &Config) -> Vec<String> {
     ]
 }
 
+fn styled_help_lines(lines: &[String], color: bool) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .map(|line| {
+            if line.starts_with('[')
+                && let Some(end) = line.find(']')
+            {
+                let section = line[..=end].to_owned();
+                let values = line[end + 1..].to_owned();
+                return Line::from(vec![
+                    Span::styled(
+                        section,
+                        if color {
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        },
+                    ),
+                    Span::styled(
+                        values,
+                        if color {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                ]);
+            }
+            if let Some((label, value)) = line.split_once(':') {
+                return Line::from(vec![
+                    Span::styled(
+                        format!("{label}:"),
+                        if color {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        },
+                    ),
+                    Span::styled(
+                        value.to_owned(),
+                        if color {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().add_modifier(Modifier::UNDERLINED)
+                        },
+                    ),
+                ]);
+            }
+            Line::from(line.clone())
+        })
+        .collect()
+}
+
 fn preview_lines(app: &App) -> Vec<Line<'static>> {
     let selected = app.reference_session.selected();
     let Some(cached) = app
@@ -893,12 +950,25 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         let area = overlay_area(rows[0], 90, height);
         frame.render_widget(Clear, area);
         frame.render_widget(
-            Paragraph::new(app.help_lines.join("\n"))
+            Paragraph::new(styled_help_lines(&app.help_lines, app.color))
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" Configuration · Esc/q/? to close "),
+                        .border_style(if app.color {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default()
+                        })
+                        .title(Line::from(" Configuration · Esc/q/? to close ").style(
+                            if app.color {
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().add_modifier(Modifier::BOLD)
+                            },
+                        )),
                 ),
             area,
         );
@@ -1112,6 +1182,23 @@ mod tests {
             app.help_lines
                 .iter()
                 .any(|line| line.contains("key_prefix=Some(\"OPS\")"))
+        );
+        let colored = styled_help_lines(&app.help_lines, true);
+        assert_eq!(colored[0].spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(colored[4].spans[0].style.fg, Some(Color::Magenta));
+        assert_eq!(colored[4].spans[1].style.fg, Some(Color::Green));
+        let plain = styled_help_lines(&app.help_lines, false);
+        assert!(
+            plain
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.fg.is_none())
+        );
+        assert!(
+            plain[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
         );
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
