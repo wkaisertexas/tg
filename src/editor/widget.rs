@@ -1272,11 +1272,13 @@ mod tests {
     #[test]
     fn editor_render_and_preview_key_options_are_configurable() {
         let mut session = EditorSession::new("one\ttwo\nthree");
-        let mut config = EditorConfig::default();
-        config.line_numbers = ConfigLineNumbers::None;
-        config.current_line_absolute = false;
-        config.tab_width = 8;
-        config.wrap = false;
+        let config = EditorConfig {
+            line_numbers: ConfigLineNumbers::None,
+            current_line_absolute: false,
+            tab_width: 8,
+            wrap: false,
+            ..EditorConfig::default()
+        };
         session.configure(&config, "ctrl-x").unwrap();
 
         assert_eq!(session.line_numbers, LineNumbers::None);
