@@ -40,6 +40,7 @@ tree-sitter-python = "0.23"
 tree-sitter-rust = "0.24"
 tree-sitter-ruby = "0.23.1"
 tree-sitter-typescript = "0.23.2"
+time = { version = "0.3.55", features = ["parsing"] }
 
 [dev-dependencies]
 assert_cmd = "2"
