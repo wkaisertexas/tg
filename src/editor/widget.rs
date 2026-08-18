@@ -11,7 +11,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use edtui::{
     EditorEventHandler, EditorMode, EditorState, EditorView, Highlight, Index2, LineNumbers, Lines,
 };
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
 use std::collections::HashMap;
 
@@ -231,6 +231,52 @@ impl EditorSession {
 
     pub fn cursor_screen_position(&self) -> Option<Position> {
         self.state.cursor_screen_position()
+    }
+
+    pub fn virtual_text_position(&self, offset: usize, area: Rect) -> Option<Position> {
+        let text = self.text();
+        let position = char_index_to_position(&text, offset)?;
+        let rows = text_rows(&text);
+        let (offset_x, offset_y) = self.state.viewport_offset();
+        if position.row < offset_y {
+            return None;
+        }
+        let gutter = if self.line_numbers == LineNumbers::None {
+            0
+        } else {
+            self.state.lines.len().max(1).to_string().len() + 1
+        };
+        let width = usize::from(area.width).saturating_sub(gutter);
+        if width == 0 {
+            return None;
+        }
+        let mut screen_row = 0;
+        for row in rows.iter().skip(offset_y).take(position.row - offset_y) {
+            screen_row += if self.wrap {
+                visual_rows(row, width, self.tab_width)
+            } else {
+                1
+            };
+        }
+        let column = visual_column(
+            rows.get(position.row)?.iter().take(position.col).copied(),
+            self.tab_width,
+        );
+        let (screen_column, wrapped_rows) = if self.wrap {
+            (column % width, column / width)
+        } else {
+            if column < offset_x {
+                return None;
+            }
+            (column - offset_x, 0)
+        };
+        screen_row += wrapped_rows;
+        (screen_row < usize::from(area.height) && screen_column < width).then(|| {
+            Position::new(
+                area.x + u16::try_from(gutter + screen_column).unwrap_or(u16::MAX),
+                area.y + u16::try_from(screen_row).unwrap_or(u16::MAX),
+            )
+        })
     }
 
     pub fn current_line_number_override(&self) -> Option<(Position, u16)> {
@@ -1474,6 +1520,22 @@ fn text_rows(text: &str) -> Vec<Vec<char>> {
         .collect()
 }
 
+fn visual_column(characters: impl IntoIterator<Item = char>, tab_width: usize) -> usize {
+    characters.into_iter().fold(0, |column, character| {
+        if character == '\t' {
+            column + tab_width - column % tab_width
+        } else {
+            column + 1
+        }
+    })
+}
+
+fn visual_rows(row: &[char], width: usize, tab_width: usize) -> usize {
+    visual_column(row.iter().copied(), tab_width)
+        .max(1)
+        .div_ceil(width)
+}
+
 fn char_slice(text: &str, range: TextRange) -> Option<String> {
     (range.start <= range.end && range.end <= text.chars().count()).then(|| {
         text.chars()
@@ -1952,6 +2014,31 @@ mod tests {
         assert_eq!(row(7), " 1 ");
         assert_eq!(row(8), "9  ");
         assert_eq!(row(9), " 1 ");
+    }
+
+    #[test]
+    fn virtual_text_positions_follow_gutters_tabs_and_wrapping() {
+        let area = Rect::new(2, 3, 20, 8);
+        let mut session = EditorSession::new("abc\nx\tz");
+        session.line_numbers = LineNumbers::None;
+        session.wrap = false;
+        session.tab_width = 4;
+        assert_eq!(
+            session.virtual_text_position(3, area),
+            Some(Position::new(5, 3))
+        );
+        assert_eq!(
+            session.virtual_text_position(7, area),
+            Some(Position::new(7, 4))
+        );
+
+        let mut wrapped = EditorSession::new("abcdef\nz");
+        wrapped.line_numbers = LineNumbers::None;
+        wrapped.wrap = true;
+        assert_eq!(
+            wrapped.virtual_text_position(8, Rect::new(0, 0, 5, 5)),
+            Some(Position::new(1, 2))
+        );
     }
 
     #[test]

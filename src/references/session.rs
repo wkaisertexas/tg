@@ -572,6 +572,14 @@ impl ReferenceSession {
         tokens::context_total(&self.reference_contexts)
     }
 
+    pub fn reference_cost(&self, reference: &ResolvedReference) -> Option<ContextCost> {
+        let identity = reference_context(reference)?.identity?;
+        self.reference_contexts
+            .iter()
+            .find(|context| context.identity.as_ref() == Some(&identity))
+            .map(|context| context_cost(context.state.clone()))
+    }
+
     pub fn cancel_operation(&mut self, request_id: OperationRequestId) {
         if self
             .pending_accept

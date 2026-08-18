@@ -7,7 +7,8 @@ use crate::references::file::FileProvider;
 use crate::references::github::GithubProvider;
 use crate::references::jira::JiraProvider;
 use crate::references::model::{
-    CandidateId, ContextCost, Preview, ReferenceCandidate, ReferenceKind, TextRange,
+    CandidateId, ContextCost, Preview, ReferenceCandidate, ReferenceKind, ReferenceTarget,
+    TextRange,
 };
 use crate::references::process::{ProcessRequest, run as run_process};
 use crate::references::session::{
@@ -791,6 +792,41 @@ fn completion_title(kind: Option<ReferenceKind>) -> &'static str {
     }
 }
 
+fn line_end_offset(text: &str, offset: usize) -> usize {
+    let characters: Vec<_> = text.chars().collect();
+    let offset = offset.min(characters.len());
+    characters[offset..]
+        .iter()
+        .position(|character| *character == '\n')
+        .map_or(characters.len(), |end| offset + end)
+}
+
+fn token_inlay_hints(app: &App) -> Vec<(usize, String)> {
+    if !app.token_config.show_file {
+        return Vec::new();
+    }
+    let mut hints: Vec<(usize, String)> = Vec::new();
+    for reference in app.document.references() {
+        if !matches!(reference.target, ReferenceTarget::File(_)) {
+            continue;
+        }
+        let Some(cost) = app.reference_session.reference_cost(reference) else {
+            continue;
+        };
+        let Some(cost) = format_context_cost(&cost, app.token_config.decimals) else {
+            continue;
+        };
+        let offset = line_end_offset(app.document.text(), reference.range.end);
+        if let Some((_, hint)) = hints.iter_mut().find(|(existing, _)| *existing == offset) {
+            hint.push_str(" · ");
+            hint.push_str(&cost);
+        } else {
+            hints.push((offset, cost));
+        }
+    }
+    hints
+}
+
 fn format_context_cost(cost: &ContextCost, decimals: u8) -> Option<String> {
     match cost {
         ContextCost::Pending => Some("…".into()),
@@ -1026,6 +1062,26 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
     frame.render_widget(app.editor.view(), rows[0]);
+    for (offset, hint) in token_inlay_hints(app) {
+        let Some(position) = app.editor.virtual_text_position(offset, rows[0]) else {
+            continue;
+        };
+        let x = position.x.saturating_add(1);
+        let width = rows[0].right().saturating_sub(x);
+        if width == 0 {
+            continue;
+        }
+        frame.render_widget(
+            Paragraph::new(format!("{hint} tokens")).style(if app.color {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC)
+            } else {
+                Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC)
+            }),
+            Rect::new(x, position.y, width, 1),
+        );
+    }
     if let Some((cursor, gutter_width)) = app.editor.current_line_number_override() {
         frame.render_widget(
             Paragraph::new("0").style(if app.color {
@@ -1312,6 +1368,42 @@ mod tests {
         assert!(app.status.starts_with("Command failed:"));
         assert!(!app.status.contains("super-secret-token"));
         assert_eq!(app.document.text(), "first\nlast");
+    }
+
+    #[test]
+    fn accepted_file_renders_token_count_as_virtual_text() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "word ".repeat(6_000)).unwrap();
+        let mut app = app_for(temp.path(), &Config::default(), "@README.md");
+        activate_text(&mut app, "@README.md");
+        wait_for(&mut app, |app| {
+            !app.reference_session.candidates().is_empty()
+        });
+        app.accept_selected();
+        wait_for(&mut app, |app| !app.document.references().is_empty());
+        wait_for(&mut app, |app| {
+            matches!(
+                app.reference_session
+                    .reference_cost(&app.document.references()[0]),
+                Some(ContextCost::Tokens(tokens)) if tokens >= 1_000
+            )
+        });
+
+        let hints = token_inlay_hints(&app);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].1.ends_with('k'));
+        assert_eq!(app.document.text(), "@README.md");
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..10 {
+            for x in 0..80 {
+                rendered.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        assert!(rendered.contains("k tokens"));
+        assert!(!app.document.text().contains("tokens"));
     }
 
     #[test]

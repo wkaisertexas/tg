@@ -38,7 +38,9 @@ The old `tg .` selector form is gone: directories are not editable files. Use
 
 The editor supports normal, insert, visual, and visual-block modes; common Vim
 motions/operators; search; undo/redo; registers; and exact `:w`, `:q`, `:q!`,
-`:wq`, and `:copy` commands. Use `Tab` or Enter to accept an active completion,
-`Esc` to dismiss it, and `Ctrl-P` to toggle its preview. In Normal mode, press
+`:wq`, `:copy`, and `:r !command` commands. Accepted file references show their
+token cost as subdued virtual text without changing the saved document. Use
+`Tab` or Enter to accept an active completion, `Esc` to dismiss it, and `Ctrl-P`
+to toggle its preview. In Normal mode, press
 `Space` then `?` to inspect active bindings and configuration. For scripts, use
 `tg --root DIR --resolve 'Inspect @src/lib.rs::Symbol'`. Upgrade with `tg update`.
