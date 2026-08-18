@@ -61,7 +61,7 @@ struct App {
     pending_clipboard: Option<String>,
     should_exit: bool,
     refs_total: ContextTotal,
-    insert_group_active: bool,
+    edit_group_active: bool,
 }
 
 impl App {
@@ -160,7 +160,7 @@ impl App {
             pending_clipboard: None,
             should_exit: false,
             refs_total: ContextTotal::default(),
-            insert_group_active: false,
+            edit_group_active: false,
         })
     }
 
@@ -457,7 +457,10 @@ impl App {
                 _ => {}
             }
         }
-        let was_insert = self.editor.mode() == AdapterMode::Insert;
+        let was_grouped = matches!(
+            self.editor.mode(),
+            AdapterMode::Insert | AdapterMode::Replace
+        );
         match self.editor.handle_event(event, self.completion_active()) {
             EditorInput::Delegated { text_changed: true } => {
                 if let Err(error) = self.sync_widget_edit() {
@@ -499,13 +502,16 @@ impl App {
             EditorInput::CommandCancelled => self.status.clear(),
             EditorInput::CommandStarted | EditorInput::CommandUpdated | EditorInput::Ignored => {}
         }
-        let is_insert = self.editor.mode() == AdapterMode::Insert;
-        if !was_insert && is_insert && !self.insert_group_active {
+        let is_grouped = matches!(
+            self.editor.mode(),
+            AdapterMode::Insert | AdapterMode::Replace
+        );
+        if !was_grouped && is_grouped && !self.edit_group_active {
             self.document.begin_insert_group();
-            self.insert_group_active = true;
-        } else if was_insert && !is_insert && self.insert_group_active {
+            self.edit_group_active = true;
+        } else if was_grouped && !is_grouped && self.edit_group_active {
             self.document.end_insert_group();
-            self.insert_group_active = false;
+            self.edit_group_active = false;
         }
     }
 }
@@ -912,6 +918,42 @@ mod tests {
             single_edit("a🦀b", "a日本b"),
             TextEdit::new(TextRange { start: 1, end: 2 }, "日本")
         );
+    }
+
+    #[test]
+    fn replace_mode_edits_form_one_history_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app_for(temp.path(), &Config::default(), "abc");
+        for event in [
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('R'),
+                KeyModifiers::SHIFT,
+            )),
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('X'),
+                KeyModifiers::NONE,
+            )),
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('Y'),
+                KeyModifiers::NONE,
+            )),
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )),
+        ] {
+            app.handle_event(event);
+        }
+        assert_eq!(app.document.text(), "XYc");
+        assert!(!app.edit_group_active);
+        assert!(!app.completion_active());
+
+        app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.document.text(), "abc");
+        assert_eq!(app.editor.text(), "abc");
     }
 
     #[test]

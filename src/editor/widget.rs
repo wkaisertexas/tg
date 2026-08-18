@@ -19,6 +19,7 @@ use std::collections::HashMap;
 pub enum AdapterMode {
     Normal,
     Insert,
+    Replace,
     VisualCharacter,
     VisualLine,
     VisualBlock,
@@ -112,6 +113,12 @@ pub struct EditorSession {
     tab_width: usize,
     wrap: bool,
     preview_toggle: KeyBinding,
+    count: usize,
+    operator_count: usize,
+    pending_operator: Option<char>,
+    pending_text_object: Option<char>,
+    pending_replace: bool,
+    replace_mode: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +149,12 @@ impl EditorSession {
                 code: KeyCode::Char('p'),
                 modifiers: KeyModifiers::CONTROL,
             },
+            count: 0,
+            operator_count: 0,
+            pending_operator: None,
+            pending_text_object: None,
+            pending_replace: false,
+            replace_mode: false,
         }
     }
 
@@ -176,6 +189,9 @@ impl EditorSession {
         }
         if self.block.is_some() {
             return AdapterMode::VisualBlock;
+        }
+        if self.replace_mode {
+            return AdapterMode::Replace;
         }
         match self.state.mode {
             EditorMode::Normal => AdapterMode::Normal,
@@ -271,6 +287,7 @@ impl EditorSession {
         self.command_line = None;
         self.block = snapshot.block;
         self.block_insert = None;
+        self.reset_pending_input();
         self.set_reference_ranges(snapshot.reference_ranges.clone())
     }
 
@@ -285,6 +302,7 @@ impl EditorSession {
         self.command_line = None;
         self.block = None;
         self.block_insert = None;
+        self.reset_pending_input();
         self.reference_ranges.clear();
         self.state.clear_highlights();
         self.set_cursor_char_offset(cursor)?;
@@ -337,6 +355,14 @@ impl EditorSession {
             }
             if self.block.is_some() {
                 return self.handle_block_key(key);
+            }
+            if self.replace_mode {
+                return self.handle_replace_mode_key(key);
+            }
+            if self.state.mode == EditorMode::Normal
+                && let Some(input) = self.handle_normal_adapter_key(key)
+            {
+                return input;
             }
             if self.state.mode == EditorMode::Normal {
                 if key.code == KeyCode::Char('u') && key.modifiers.is_empty() {
@@ -404,6 +430,412 @@ impl EditorSession {
             self.state.clear_highlights();
         }
         EditorInput::Delegated { text_changed }
+    }
+
+    fn handle_normal_adapter_key(&mut self, key: KeyEvent) -> Option<EditorInput> {
+        if self.pending_replace {
+            self.pending_replace = false;
+            return Some(match key.code {
+                KeyCode::Esc => {
+                    self.count = 0;
+                    EditorInput::Delegated {
+                        text_changed: false,
+                    }
+                }
+                KeyCode::Char(character)
+                    if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+                {
+                    let count = self.take_count();
+                    self.replace_characters(character, count)
+                }
+                _ => {
+                    self.count = 0;
+                    EditorInput::Ignored
+                }
+            });
+        }
+
+        if let Some(operator) = self.pending_operator {
+            if let KeyCode::Char(digit) = key.code
+                && key.modifiers.is_empty()
+                && digit.is_ascii_digit()
+            {
+                self.push_count(digit);
+                return Some(EditorInput::Ignored);
+            }
+            if self.pending_text_object.is_none()
+                && let KeyCode::Char(kind @ ('i' | 'a')) = key.code
+            {
+                self.pending_text_object = Some(kind);
+                return Some(EditorInput::Ignored);
+            }
+            if let Some(kind) = self.pending_text_object
+                && let KeyCode::Char(object) = key.code
+            {
+                return Some(self.apply_text_object(operator, kind, object));
+            }
+            return Some(match key.code {
+                KeyCode::Char(character) if character == operator => {
+                    self.apply_line_operator(operator)
+                }
+                KeyCode::Char('w') => self.apply_word_operator(operator),
+                KeyCode::Esc => {
+                    self.cancel_operator();
+                    EditorInput::Delegated {
+                        text_changed: false,
+                    }
+                }
+                _ => {
+                    self.cancel_operator();
+                    EditorInput::Ignored
+                }
+            });
+        }
+
+        if let KeyCode::Char(digit) = key.code
+            && key.modifiers.is_empty()
+            && digit.is_ascii_digit()
+            && (digit != '0' || self.count > 0)
+        {
+            self.push_count(digit);
+            return Some(EditorInput::Ignored);
+        }
+        if let KeyCode::Char(operator @ ('d' | 'c' | 'y')) = key.code
+            && key.modifiers.is_empty()
+        {
+            self.operator_count = self.take_count();
+            self.pending_operator = Some(operator);
+            return Some(EditorInput::Ignored);
+        }
+        if key.code == KeyCode::Char('r') && key.modifiers.is_empty() {
+            self.pending_replace = true;
+            return Some(EditorInput::Ignored);
+        }
+        if key.code == KeyCode::Char('R') && key.modifiers == KeyModifiers::SHIFT {
+            self.count = 0;
+            self.replace_mode = true;
+            return Some(EditorInput::Delegated {
+                text_changed: false,
+            });
+        }
+        if self.count > 0
+            && matches!(
+                key.code,
+                KeyCode::Char('h' | 'j' | 'k' | 'l' | 'w' | 'e' | 'b')
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+            )
+        {
+            let count = self.take_count();
+            return Some(self.repeat_event(key, count));
+        }
+        self.count = 0;
+        None
+    }
+
+    fn apply_word_operator(&mut self, operator: char) -> EditorInput {
+        let count = self.combined_count();
+        let Some(range) = self.word_motion_range(count) else {
+            self.cancel_operator();
+            return EditorInput::Ignored;
+        };
+        if operator == 'y' || (operator == 'c' && count > 1) {
+            return self.apply_operator_range(operator, range, false);
+        }
+        let removed = char_slice(&self.text(), range).expect("word range must be valid");
+        self.write_register(RegisterValue::Character(removed));
+        self.reset_operator();
+        let before = self.text();
+        self.delegate(Event::Key(KeyEvent::new(
+            KeyCode::Char(operator),
+            KeyModifiers::NONE,
+        )));
+        self.delegate(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::NONE,
+        )));
+        if operator == 'd' {
+            for _ in 1..count {
+                self.delegate(Event::Key(KeyEvent::new(
+                    KeyCode::Char('d'),
+                    KeyModifiers::NONE,
+                )));
+                self.delegate(Event::Key(KeyEvent::new(
+                    KeyCode::Char('w'),
+                    KeyModifiers::NONE,
+                )));
+            }
+        }
+        EditorInput::Delegated {
+            text_changed: self.text() != before,
+        }
+    }
+
+    fn apply_line_operator(&mut self, operator: char) -> EditorInput {
+        let count = self.combined_count();
+        let Some(range) = self.line_operator_range(count) else {
+            self.cancel_operator();
+            return EditorInput::Ignored;
+        };
+        if operator != 'd' {
+            return self.apply_operator_range(operator, range, true);
+        }
+        let removed = char_slice(&self.text(), range).expect("line range must be valid");
+        self.write_register(RegisterValue::Line(removed));
+        self.reset_operator();
+        let before = self.text();
+        for _ in 0..count {
+            self.delegate(Event::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::NONE,
+            )));
+            self.delegate(Event::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::NONE,
+            )));
+        }
+        EditorInput::Delegated {
+            text_changed: self.text() != before,
+        }
+    }
+
+    fn repeat_event(&mut self, key: KeyEvent, count: usize) -> EditorInput {
+        let before = self.text();
+        for _ in 0..count.max(1) {
+            self.delegate(Event::Key(key));
+        }
+        EditorInput::Delegated {
+            text_changed: self.text() != before,
+        }
+    }
+
+    fn apply_text_object(&mut self, operator: char, kind: char, object: char) -> EditorInput {
+        let count = self.combined_count();
+        let Some(mut range) = self.text_object_range(kind, object) else {
+            self.cancel_operator();
+            return EditorInput::Ignored;
+        };
+        if object == 'w' && count > 1 {
+            range.end = self
+                .word_motion_range_from(range.end, count - 1)
+                .unwrap_or(range.end);
+        }
+        self.apply_operator_range(operator, range, false)
+    }
+
+    fn apply_operator_range(
+        &mut self,
+        operator: char,
+        range: TextRange,
+        linewise: bool,
+    ) -> EditorInput {
+        self.reset_operator();
+        let removed = char_slice(&self.text(), range).expect("operator range must be valid");
+        let preserve_line = operator == 'c' && linewise && removed.ends_with('\n');
+        self.write_register(if linewise {
+            RegisterValue::Line(removed)
+        } else {
+            RegisterValue::Character(removed)
+        });
+        match operator {
+            'y' => EditorInput::Delegated {
+                text_changed: false,
+            },
+            'c' | 'd' => {
+                self.replace_char_range(
+                    range,
+                    if preserve_line { "\n" } else { "" },
+                    range.start,
+                    operator == 'c',
+                );
+                EditorInput::Delegated { text_changed: true }
+            }
+            _ => EditorInput::Ignored,
+        }
+    }
+
+    fn word_motion_range(&self, count: usize) -> Option<TextRange> {
+        let start = self.cursor_char_offset();
+        self.word_motion_range_from(start, count)
+            .map(|end| TextRange { start, end })
+    }
+
+    fn word_motion_range_from(&self, start: usize, count: usize) -> Option<usize> {
+        let chars: Vec<_> = self.text().chars().collect();
+        let mut end = start;
+        for _ in 0..count {
+            let class = word_class(*chars.get(end)?);
+            while end < chars.len() && word_class(chars[end]) == class {
+                end += 1;
+            }
+            while end < chars.len() && chars[end].is_whitespace() {
+                end += 1;
+            }
+        }
+        Some(end)
+    }
+
+    fn line_operator_range(&self, count: usize) -> Option<TextRange> {
+        let text = self.text();
+        let rows = text_rows(&text);
+        let start_row = self.state.cursor.row;
+        let end_row = (start_row + count).min(rows.len());
+        let start = position_to_char_index(&text, Index2::new(start_row, 0))?;
+        let end = if end_row < rows.len() {
+            position_to_char_index(&text, Index2::new(end_row, 0))?
+        } else {
+            text.chars().count()
+        };
+        Some(TextRange { start, end })
+    }
+
+    fn text_object_range(&self, kind: char, object: char) -> Option<TextRange> {
+        let around = kind == 'a';
+        if object == 'w' {
+            return self.word_text_object_range(self.cursor_char_offset(), around);
+        }
+        let (opening, closing) = match object {
+            '\'' => ('\'', '\''),
+            '"' => ('"', '"'),
+            '(' | ')' => ('(', ')'),
+            '[' | ']' => ('[', ']'),
+            '{' | '}' => ('{', '}'),
+            _ => return None,
+        };
+        let text = self.text();
+        let chars: Vec<_> = text.chars().collect();
+        let cursor = self.cursor_char_offset();
+        let start = (0..=cursor.min(chars.len().saturating_sub(1)))
+            .rev()
+            .find(|index| chars[*index] == opening)?;
+        let end = (cursor.max(start + 1)..chars.len()).find(|index| chars[*index] == closing)?;
+        Some(if around {
+            TextRange {
+                start,
+                end: end + 1,
+            }
+        } else {
+            TextRange {
+                start: start + 1,
+                end,
+            }
+        })
+    }
+
+    fn word_text_object_range(&self, offset: usize, around: bool) -> Option<TextRange> {
+        let chars: Vec<_> = self.text().chars().collect();
+        let character = *chars.get(offset)?;
+        let class = word_class(character);
+        let mut start = offset;
+        while start > 0 && word_class(chars[start - 1]) == class {
+            start -= 1;
+        }
+        let mut end = offset + 1;
+        while end < chars.len() && word_class(chars[end]) == class {
+            end += 1;
+        }
+        if around {
+            if end < chars.len() && chars[end].is_whitespace() {
+                while end < chars.len() && chars[end].is_whitespace() {
+                    end += 1;
+                }
+            } else {
+                while start > 0 && chars[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+            }
+        }
+        Some(TextRange { start, end })
+    }
+
+    fn replace_characters(&mut self, character: char, count: usize) -> EditorInput {
+        let text = self.text();
+        let rows = text_rows(&text);
+        let cursor = self.state.cursor;
+        let available = rows
+            .get(cursor.row)
+            .map_or(0, |row| row.len().saturating_sub(cursor.col));
+        let count = count.max(1).min(available);
+        if count == 0 {
+            return EditorInput::Ignored;
+        }
+        let start = self.cursor_char_offset();
+        let replacement: String = std::iter::repeat_n(character, count).collect();
+        self.replace_char_range(
+            TextRange {
+                start,
+                end: start + count,
+            },
+            &replacement,
+            start,
+            false,
+        );
+        EditorInput::Delegated { text_changed: true }
+    }
+
+    fn handle_replace_mode_key(&mut self, key: KeyEvent) -> EditorInput {
+        match key.code {
+            KeyCode::Esc => {
+                self.replace_mode = false;
+                if self.state.cursor.col > 0 {
+                    self.state.cursor.col -= 1;
+                }
+                EditorInput::Delegated {
+                    text_changed: false,
+                }
+            }
+            KeyCode::Char(character)
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+            {
+                let start = self.cursor_char_offset();
+                let row_len = text_rows(&self.text())[self.state.cursor.row].len();
+                let end = start + usize::from(self.state.cursor.col < row_len);
+                self.replace_char_range(
+                    TextRange { start, end },
+                    &character.to_string(),
+                    start + 1,
+                    false,
+                );
+                self.replace_mode = true;
+                EditorInput::Delegated { text_changed: true }
+            }
+            _ => EditorInput::Ignored,
+        }
+    }
+
+    fn push_count(&mut self, digit: char) {
+        self.count = self
+            .count
+            .saturating_mul(10)
+            .saturating_add(digit.to_digit(10).unwrap() as usize);
+    }
+
+    fn take_count(&mut self) -> usize {
+        std::mem::take(&mut self.count).max(1)
+    }
+
+    fn combined_count(&mut self) -> usize {
+        self.operator_count.max(1).saturating_mul(self.take_count())
+    }
+
+    fn reset_operator(&mut self) {
+        self.count = 0;
+        self.operator_count = 0;
+        self.pending_operator = None;
+        self.pending_text_object = None;
+    }
+
+    fn cancel_operator(&mut self) {
+        self.reset_operator();
+        self.selected_register = '"';
+    }
+
+    fn reset_pending_input(&mut self) {
+        self.cancel_operator();
+        self.pending_replace = false;
+        self.replace_mode = false;
     }
 
     fn handle_command_key(&mut self, key: KeyEvent) -> EditorInput {
@@ -1056,6 +1488,16 @@ fn register_as_text(value: &RegisterValue) -> String {
     }
 }
 
+fn word_class(character: char) -> u8 {
+    if character.is_whitespace() {
+        0
+    } else if character.is_alphanumeric() || character == '_' {
+        1
+    } else {
+        2
+    }
+}
+
 fn transform_chars(chars: &mut [char], operator: TextOperator) -> bool {
     let mut changed = false;
     for character in chars {
@@ -1216,6 +1658,180 @@ mod tests {
         line.handle_event(key(KeyCode::Char('d')), false);
         assert_eq!(line.text(), "c\n");
         assert_eq!(line.mode(), AdapterMode::Normal);
+    }
+
+    #[test]
+    fn counted_motions_and_operator_composition_follow_vim_counts() {
+        let mut motion = EditorSession::new("one two three four");
+        motion.handle_event(key(KeyCode::Char('2')), false);
+        motion.handle_event(key(KeyCode::Char('w')), false);
+        assert_eq!(motion.state().cursor, Index2::new(0, 8));
+
+        let mut operator = EditorSession::new("one two three four five");
+        operator.handle_event(key(KeyCode::Char('2')), false);
+        operator.handle_event(key(KeyCode::Char('d')), false);
+        operator.handle_event(key(KeyCode::Char('2')), false);
+        operator.handle_event(key(KeyCode::Char('w')), false);
+        assert_eq!(operator.text(), "five");
+        assert_eq!(
+            operator.register_text('"').as_deref(),
+            Some("one two three four ")
+        );
+
+        let mut lines = EditorSession::new("one\ntwo\nthree\nfour\n");
+        lines.handle_event(key(KeyCode::Char('2')), false);
+        lines.handle_event(key(KeyCode::Char('d')), false);
+        lines.handle_event(key(KeyCode::Char('d')), false);
+        assert_eq!(lines.text(), "three\nfour\n");
+    }
+
+    #[test]
+    fn word_text_objects_cover_inner_and_around_forms() {
+        let mut inner = EditorSession::new("one two");
+        inner.handle_event(key(KeyCode::Char('l')), false);
+        inner.handle_event(key(KeyCode::Char('d')), false);
+        inner.handle_event(key(KeyCode::Char('i')), false);
+        inner.handle_event(key(KeyCode::Char('w')), false);
+        assert_eq!(inner.text(), " two");
+
+        let mut around = EditorSession::new("one two");
+        around.handle_event(key(KeyCode::Char('l')), false);
+        around.handle_event(key(KeyCode::Char('d')), false);
+        around.handle_event(key(KeyCode::Char('a')), false);
+        around.handle_event(key(KeyCode::Char('w')), false);
+        assert_eq!(around.text(), "two");
+    }
+
+    #[test]
+    fn quote_and_bracket_text_objects_cover_inner_and_around_forms() {
+        for (source, cursor, object, expected) in [
+            ("say \"hello world\" now", 6, "i\"", "say \"\" now"),
+            ("call(alpha + beta) now", 7, "a(", "call now"),
+            ("map[key + value] tail", 5, "i]", "map[] tail"),
+            ("map{key + value} tail", 5, "a}", "map tail"),
+            ("say 'hello' now", 6, "a'", "say  now"),
+        ] {
+            let mut session = EditorSession::new(source);
+            session.set_cursor_char_offset(cursor).unwrap();
+            session.handle_event(key(KeyCode::Char('d')), false);
+            for character in object.chars() {
+                session.handle_event(key(KeyCode::Char(character)), false);
+            }
+            assert_eq!(session.text(), expected, "object {object}");
+        }
+    }
+
+    #[test]
+    fn change_and_yank_compose_with_motions_and_text_objects() {
+        let mut change = EditorSession::new("one two three");
+        change.handle_event(key(KeyCode::Char('2')), false);
+        change.handle_event(key(KeyCode::Char('c')), false);
+        change.handle_event(key(KeyCode::Char('w')), false);
+        change.handle_event(key(KeyCode::Char('X')), false);
+        change.handle_event(key(KeyCode::Esc), false);
+        assert_eq!(change.text(), "Xthree");
+        assert_eq!(change.register_text('"').as_deref(), Some("one two "));
+
+        let mut quoted = EditorSession::new("say \"hello world\" now");
+        quoted.set_cursor_char_offset(6).unwrap();
+        quoted.handle_event(key(KeyCode::Char('"')), false);
+        quoted.handle_event(key(KeyCode::Char('a')), false);
+        for character in "ci\"".chars() {
+            quoted.handle_event(key(KeyCode::Char(character)), false);
+        }
+        quoted.handle_event(key(KeyCode::Char('X')), false);
+        quoted.handle_event(key(KeyCode::Esc), false);
+        assert_eq!(quoted.text(), "say \"X\" now");
+        assert_eq!(quoted.register_text('a').as_deref(), Some("hello world"));
+        assert_eq!(quoted.register_text('"').as_deref(), Some("hello world"));
+
+        let mut yank = EditorSession::new("call(alpha + beta) now");
+        yank.set_cursor_char_offset(7).unwrap();
+        yank.handle_event(key(KeyCode::Char('"')), false);
+        yank.handle_event(key(KeyCode::Char('b')), false);
+        for character in "ya(".chars() {
+            yank.handle_event(key(KeyCode::Char(character)), false);
+        }
+        assert_eq!(yank.text(), "call(alpha + beta) now");
+        assert_eq!(yank.register_text('b').as_deref(), Some("(alpha + beta)"));
+        assert_eq!(yank.register_text('"').as_deref(), Some("(alpha + beta)"));
+
+        let mut motion = EditorSession::new("one two three");
+        motion.handle_event(key(KeyCode::Char('2')), false);
+        motion.handle_event(key(KeyCode::Char('y')), false);
+        motion.handle_event(key(KeyCode::Char('w')), false);
+        assert_eq!(motion.text(), "one two three");
+        assert_eq!(motion.register_text('"').as_deref(), Some("one two "));
+
+        let mut line_change = EditorSession::new("one\ntwo\n");
+        line_change.handle_event(key(KeyCode::Char('c')), false);
+        line_change.handle_event(key(KeyCode::Char('c')), false);
+        line_change.handle_event(key(KeyCode::Char('X')), false);
+        line_change.handle_event(key(KeyCode::Esc), false);
+        assert_eq!(line_change.text(), "X\ntwo\n");
+
+        let mut line_yank = EditorSession::new("one\ntwo\n");
+        line_yank.handle_event(key(KeyCode::Char('y')), false);
+        line_yank.handle_event(key(KeyCode::Char('y')), false);
+        assert_eq!(line_yank.text(), "one\ntwo\n");
+        assert_eq!(line_yank.register_text('"').as_deref(), Some("one\n"));
+    }
+
+    #[test]
+    fn cancelled_and_unsupported_operator_sequences_do_not_leak_state() {
+        let mut cancelled = EditorSession::new("one two");
+        cancelled.handle_event(key(KeyCode::Char('"')), false);
+        cancelled.handle_event(key(KeyCode::Char('a')), false);
+        cancelled.handle_event(key(KeyCode::Char('2')), false);
+        cancelled.handle_event(key(KeyCode::Char('d')), false);
+        cancelled.handle_event(key(KeyCode::Esc), false);
+        cancelled.handle_event(key(KeyCode::Char('y')), false);
+        cancelled.handle_event(key(KeyCode::Char('i')), false);
+        cancelled.handle_event(key(KeyCode::Char('w')), false);
+        assert_eq!(cancelled.text(), "one two");
+        assert_eq!(cancelled.register_text('a'), None);
+        assert_eq!(cancelled.register_text('"').as_deref(), Some("one"));
+
+        let mut unsupported = EditorSession::new("one two");
+        unsupported.handle_event(key(KeyCode::Char('d')), false);
+        unsupported.handle_event(key(KeyCode::Char('i')), false);
+        assert_eq!(
+            unsupported.handle_event(key(KeyCode::Char('z')), false),
+            EditorInput::Ignored
+        );
+        unsupported.handle_event(key(KeyCode::Char('w')), false);
+        assert_eq!(unsupported.text(), "one two");
+        assert_eq!(unsupported.state().cursor, Index2::new(0, 4));
+    }
+
+    #[test]
+    fn dot_repeats_the_last_delegated_change() {
+        let mut delete = EditorSession::new("one two three");
+        delete.handle_event(key(KeyCode::Char('d')), false);
+        delete.handle_event(key(KeyCode::Char('w')), false);
+        delete.handle_event(key(KeyCode::Char('.')), false);
+        assert_eq!(delete.text(), "three");
+    }
+
+    #[test]
+    fn replace_operation_replace_mode_and_join_are_available() {
+        let mut operation = EditorSession::new("abc");
+        operation.handle_event(key(KeyCode::Char('r')), false);
+        operation.handle_event(key(KeyCode::Char('X')), false);
+        assert_eq!(operation.text(), "Xbc");
+        assert_eq!(operation.mode(), AdapterMode::Normal);
+
+        let mut mode = EditorSession::new("abc");
+        mode.handle_event(shift('R'), false);
+        mode.handle_event(key(KeyCode::Char('X')), false);
+        mode.handle_event(key(KeyCode::Char('Y')), false);
+        mode.handle_event(key(KeyCode::Esc), false);
+        assert_eq!(mode.text(), "XYc");
+        assert_eq!(mode.mode(), AdapterMode::Normal);
+
+        let mut join = EditorSession::new("one \ntwo\nthree");
+        join.handle_event(shift('J'), false);
+        assert_eq!(join.text(), "one two\nthree");
     }
 
     #[test]
