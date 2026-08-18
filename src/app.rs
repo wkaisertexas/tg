@@ -9,12 +9,13 @@ use crate::references::jira::JiraProvider;
 use crate::references::model::{
     CandidateId, ContextCost, Preview, ReferenceCandidate, ReferenceKind, TextRange,
 };
+use crate::references::process::{ProcessRequest, run as run_process};
 use crate::references::session::{
     DocumentRevision, LowerPurpose, OperationKind, ReferenceEvent, ReferenceSession,
 };
 use crate::references::skill::SkillProvider;
 use crate::references::symbol::SymbolProvider;
-use crate::references::{ReferenceProvider, ThreadExecutor};
+use crate::references::{BackgroundExecutor, CancellationFlag, ReferenceProvider, ThreadExecutor};
 use crate::repository::Repository;
 use crate::tokens::ContextTotal;
 use anyhow::{Context, Result};
@@ -27,11 +28,28 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 struct CachedPreview {
     candidate_id: CandidateId,
     preview: Option<Preview>,
+}
+
+const SHELL_TIMEOUT: Duration = Duration::from_secs(30);
+const SHELL_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+struct PendingShell {
+    id: u64,
+    cancellation: CancellationFlag,
+}
+
+struct ShellResult {
+    id: u64,
+    revision: DocumentRevision,
+    offset: usize,
+    prefix_newline: bool,
+    output: Result<Vec<u8>, String>,
 }
 
 struct App {
@@ -65,6 +83,10 @@ struct App {
     help_lines: Vec<String>,
     help_pending: bool,
     help_visible: bool,
+    shell_sender: Sender<ShellResult>,
+    shell_receiver: Receiver<ShellResult>,
+    pending_shell: Option<PendingShell>,
+    next_shell_id: u64,
 }
 
 impl App {
@@ -136,6 +158,7 @@ impl App {
         } else {
             Style::default().add_modifier(Modifier::UNDERLINED)
         })?;
+        let (shell_sender, shell_receiver) = mpsc::channel();
         Ok(Self {
             repo,
             document,
@@ -167,6 +190,10 @@ impl App {
             help_lines: config_help_lines(config),
             help_pending: false,
             help_visible: false,
+            shell_sender,
+            shell_receiver,
+            pending_shell: None,
+            next_shell_id: 0,
         })
     }
 
@@ -257,6 +284,7 @@ impl App {
     }
 
     fn tick(&mut self, now: Instant) {
+        self.drain_shell_results();
         if self.status != self.observed_status {
             self.observed_status.clone_from(&self.status);
             self.status_changed_at = now;
@@ -283,6 +311,113 @@ impl App {
         }
     }
 
+    fn begin_shell_read(&mut self, command: String) {
+        if let Some(pending) = self.pending_shell.take() {
+            pending.cancellation.cancel();
+        }
+        self.next_shell_id = self.next_shell_id.wrapping_add(1);
+        let id = self.next_shell_id;
+        let revision = self.revision();
+        let (offset, prefix_newline) =
+            shell_insertion_point(self.document.text(), self.editor.cursor_char_offset());
+        let cancellation = CancellationFlag::default();
+        let worker_cancellation = cancellation.clone();
+        let sender = self.shell_sender.clone();
+        let cwd = self.repo.invocation_root.clone();
+        ThreadExecutor.spawn(Box::new(move || {
+            let output = run_process(
+                ProcessRequest {
+                    executable: "bash".into(),
+                    args: vec!["-c".into(), command.into()],
+                    cwd,
+                    timeout: SHELL_TIMEOUT,
+                    output_limit: SHELL_OUTPUT_LIMIT,
+                    env: Vec::new(),
+                },
+                &worker_cancellation,
+            )
+            .map(|output| output.stdout)
+            .map_err(|error| error.to_string());
+            let _ = sender.send(ShellResult {
+                id,
+                revision,
+                offset,
+                prefix_newline,
+                output,
+            });
+        }));
+        self.pending_shell = Some(PendingShell { id, cancellation });
+        self.status = "Running shell command…".into();
+    }
+
+    fn drain_shell_results(&mut self) {
+        loop {
+            let result = match self.shell_receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+            };
+            if !self
+                .pending_shell
+                .as_ref()
+                .is_some_and(|pending| pending.id == result.id)
+            {
+                continue;
+            }
+            self.pending_shell = None;
+            if result.revision != self.revision() {
+                self.status = "Command output discarded because the document changed".into();
+                continue;
+            }
+            let bytes = match result.output {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.status = format!("Command failed: {error}");
+                    continue;
+                }
+            };
+            if bytes.is_empty() {
+                self.status = "Command produced no output".into();
+                continue;
+            }
+            let output = match String::from_utf8(bytes) {
+                Ok(output) => output,
+                Err(_) => {
+                    self.status = "Command failed: output is not UTF-8".into();
+                    continue;
+                }
+            };
+            let mut insertion = String::new();
+            if result.prefix_newline {
+                insertion.push('\n');
+            }
+            insertion.push_str(&output);
+            if !insertion.ends_with('\n') {
+                insertion.push('\n');
+            }
+            let inserted_bytes = insertion.len();
+            let cursor = result.offset + usize::from(result.prefix_newline);
+            let edit = TextEdit::new(
+                TextRange {
+                    start: result.offset,
+                    end: result.offset,
+                },
+                insertion,
+            );
+            let update = self
+                .document
+                .apply(&[edit])
+                .and_then(|_| self.replace_widget_from_document())
+                .and_then(|_| self.editor.set_cursor_char_offset(cursor))
+                .and_then(|_| self.sync_reference_state());
+            match update {
+                Ok(()) => self.status = format!("Read {inserted_bytes} bytes from shell"),
+                Err(error) => {
+                    self.status = format!("Command output could not be inserted: {error}")
+                }
+            }
+        }
+    }
+
     fn begin_lower(&mut self, request: LowerRequest) {
         let snapshot = request.snapshot;
         match self.reference_session.begin_lower_snapshot(
@@ -306,6 +441,7 @@ impl App {
         match self.commands.dispatch(&line, &self.document) {
             Ok(CommandEffect::Quit) => self.should_exit = true,
             Ok(CommandEffect::Lower(request)) => self.begin_lower(request),
+            Ok(CommandEffect::ReadShell(command)) => self.begin_shell_read(command),
             Err(error) => self.status = error.to_string(),
         }
     }
@@ -557,11 +693,32 @@ impl App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending_shell.take() {
+            pending.cancellation.cancel();
+        }
+    }
+}
+
 fn operation_name(kind: OperationKind) -> &'static str {
     match kind {
         OperationKind::Accept => "resolve reference",
         OperationKind::Preview => "load preview",
         OperationKind::Lower => "lower document",
+    }
+}
+
+fn shell_insertion_point(text: &str, cursor: usize) -> (usize, bool) {
+    let characters: Vec<_> = text.chars().collect();
+    let cursor = cursor.min(characters.len());
+    if let Some(line_end) = characters[cursor..]
+        .iter()
+        .position(|character| *character == '\n')
+    {
+        (cursor + line_end + 1, false)
+    } else {
+        (characters.len(), !characters.is_empty())
     }
 }
 
@@ -653,6 +810,8 @@ fn status_is_sticky(status: &str) -> bool {
     status.starts_with("Cannot ")
         || status.starts_with("Write failed:")
         || status.starts_with("Save failed:")
+        || status.starts_with("Command failed:")
+        || status.starts_with("Command output could not be inserted:")
 }
 
 fn status_text(app: &App, width: u16) -> String {
@@ -704,7 +863,7 @@ fn config_help_lines(config: &Config) -> Vec<String> {
         "Completion: Tab/Enter accept · Up/Down or Ctrl-J/Ctrl-K select".into(),
         format!("Preview: {}", config.ui.preview_toggle),
         format!(
-            "Commands: :w · :q · :q! · :wq · {}",
+            "Commands: :w · :q · :q! · :wq · {} · :r !command",
             config.editor.copy_command
         ),
         format!(
@@ -1081,6 +1240,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             app.drain_reference_events();
+            app.drain_shell_results();
             if ready(app) {
                 return;
             }
@@ -1114,6 +1274,44 @@ mod tests {
             single_edit("a🦀b", "a日本b"),
             TextEdit::new(TextRange { start: 1, end: 2 }, "日本")
         );
+    }
+
+    #[test]
+    fn shell_insertion_points_follow_the_current_line() {
+        assert_eq!(shell_insertion_point("", 0), (0, false));
+        assert_eq!(shell_insertion_point("one", 1), (3, true));
+        assert_eq!(shell_insertion_point("one\ntwo", 1), (4, false));
+        assert_eq!(shell_insertion_point("one\ntwo", 5), (7, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_shell_command_inserts_bounded_output_as_one_undoable_edit() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app_for(temp.path(), &Config::default(), "first\nlast");
+        app.editor.set_cursor_char_offset(1).unwrap();
+
+        app.dispatch_command(":r !printf 'alpha\\nbeta'".into());
+        assert!(app.pending_shell.is_some());
+        assert_eq!(app.document.text(), "first\nlast");
+        wait_for(&mut app, |app| app.pending_shell.is_none());
+        assert_eq!(app.document.text(), "first\nalpha\nbeta\nlast");
+        assert_eq!(app.editor.text(), app.document.text());
+        assert!(app.status.starts_with("Read "));
+
+        app.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.document.text(), "first\nlast");
+
+        app.dispatch_command(
+            ":r !printf 'Authorization: Bearer super-secret-token' >&2; exit 7".into(),
+        );
+        wait_for(&mut app, |app| app.pending_shell.is_none());
+        assert!(app.status.starts_with("Command failed:"));
+        assert!(!app.status.contains("super-secret-token"));
+        assert_eq!(app.document.text(), "first\nlast");
     }
 
     #[test]

@@ -3,13 +3,14 @@ pub use crate::references::session::LowerPurpose;
 use std::error::Error;
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExCommand {
     Write,
     Quit,
     ForceQuit,
     WriteAndQuit,
     Copy,
+    ReadShell(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,7 @@ impl LowerRequest {
 pub enum CommandEffect {
     Quit,
     Lower(LowerRequest),
+    ReadShell(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +52,7 @@ pub enum CommandError {
     Empty,
     Unknown(String),
     ArgumentsNotSupported(String),
+    EmptyShellCommand,
     NoWriteSinceLastChange,
     NoFileName,
 }
@@ -65,6 +68,7 @@ impl fmt::Display for CommandError {
             Self::ArgumentsNotSupported(command) => {
                 write!(formatter, "command does not accept arguments: {command}")
             }
+            Self::EmptyShellCommand => formatter.write_str("read command requires text after `!`"),
             Self::NoWriteSinceLastChange => formatter.write_str("No write since last change"),
             Self::NoFileName => formatter.write_str("No file name"),
         }
@@ -85,6 +89,8 @@ impl CommandDispatcher {
             || copy_command.len() == 1
             || copy_command.trim() != copy_command
             || matches!(copy_command.as_str(), ":w" | ":q" | ":q!" | ":wq")
+            || copy_command.starts_with(":r !")
+            || copy_command.starts_with(":read !")
         {
             return Err(CommandError::InvalidCopyCommand);
         }
@@ -100,6 +106,16 @@ impl CommandDispatcher {
         }
         if command == self.copy_command {
             return Ok(ExCommand::Copy);
+        }
+        if let Some(shell) = [":r !", ":read !"]
+            .into_iter()
+            .find_map(|prefix| command.strip_prefix(prefix))
+        {
+            let shell = shell.trim();
+            if shell.is_empty() {
+                return Err(CommandError::EmptyShellCommand);
+            }
+            return Ok(ExCommand::ReadShell(shell.into()));
         }
         match command {
             ":w" => Ok(ExCommand::Write),
@@ -127,6 +143,7 @@ impl CommandDispatcher {
                 purpose: LowerPurpose::Copy,
                 snapshot: document.snapshot(),
             })),
+            ExCommand::ReadShell(command) => Ok(CommandEffect::ReadShell(command)),
         }
     }
 
@@ -185,6 +202,34 @@ mod tests {
     }
 
     #[test]
+    fn read_shell_commands_require_explicit_bang_syntax() {
+        let parser = dispatcher();
+        assert_eq!(
+            parser.parse(":r !printf 'hello'").unwrap(),
+            ExCommand::ReadShell("printf 'hello'".into())
+        );
+        assert_eq!(
+            parser.parse(":read !printf 'hello world'").unwrap(),
+            ExCommand::ReadShell("printf 'hello world'".into())
+        );
+        assert_eq!(
+            parser.parse(":r !   ").unwrap_err(),
+            CommandError::EmptyShellCommand
+        );
+        assert!(matches!(
+            parser.parse(":r printf x"),
+            Err(CommandError::Unknown(_))
+        ));
+        let CommandEffect::ReadShell(command) = parser
+            .dispatch(":r !printf ok", &Document::unnamed())
+            .unwrap()
+        else {
+            panic!("read did not request shell execution")
+        };
+        assert_eq!(command, "printf ok");
+    }
+
+    #[test]
     fn arguments_are_rejected_instead_of_becoming_paths_or_force_variants() {
         let parser = dispatcher();
         for input in [
@@ -218,7 +263,18 @@ mod tests {
             parser.parse(":clip prompt extra"),
             Err(CommandError::ArgumentsNotSupported(_))
         ));
-        for invalid in ["copy", ":", " :copy", ":copy ", ":w", ":q", ":q!", ":wq"] {
+        for invalid in [
+            "copy",
+            ":",
+            " :copy",
+            ":copy ",
+            ":w",
+            ":q",
+            ":q!",
+            ":wq",
+            ":r !echo shadow",
+            ":read !echo shadow",
+        ] {
             assert_eq!(
                 CommandDispatcher::new(invalid).unwrap_err(),
                 CommandError::InvalidCopyCommand

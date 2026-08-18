@@ -3,7 +3,7 @@ pub mod file;
 pub mod github;
 pub mod jira;
 pub mod model;
-mod process;
+pub(crate) mod process;
 pub mod session;
 pub mod skill;
 pub mod symbol;
