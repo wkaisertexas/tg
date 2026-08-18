@@ -297,7 +297,9 @@ impl EditorSession {
         ranges: impl IntoIterator<Item = TextRange>,
     ) -> Result<()> {
         let cursor = self.cursor_char_offset().min(text.as_ref().chars().count());
+        let mode = self.state.mode;
         self.state = EditorState::new(Lines::from(text.as_ref()));
+        self.state.mode = mode;
         self.events = EditorEventHandler::vim_mode();
         self.command_line = None;
         self.block = None;
@@ -1998,6 +2000,26 @@ mod tests {
             .unwrap();
         assert_eq!(session.text(), "x🦀y");
         assert_eq!(session.state().highlights.len(), 1);
+    }
+
+    #[test]
+    fn accepted_reference_replacement_preserves_insert_mode() {
+        let mut session = EditorSession::new("@src");
+        session.set_cursor_char_offset(4).unwrap();
+        session.handle_event(key(KeyCode::Char('i')), false);
+        session
+            .replace_text_and_ranges("@src/app.rs", [TextRange { start: 0, end: 11 }])
+            .unwrap();
+        session.set_cursor_char_offset(11).unwrap();
+
+        assert_eq!(session.mode(), AdapterMode::Insert);
+        assert_eq!(
+            session.handle_event(key(KeyCode::Char(':')), false),
+            EditorInput::Delegated { text_changed: true }
+        );
+        assert_eq!(session.text(), "@src/app.rs:");
+        assert_eq!(session.mode(), AdapterMode::Insert);
+        assert_eq!(session.command_line(), None);
     }
 
     #[test]

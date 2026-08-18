@@ -921,6 +921,39 @@ mod tests {
     }
 
     #[test]
+    fn accepted_file_completion_stays_inserted_for_symbol_chaining() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/app.rs"), "pub fn submit() {}\n").unwrap();
+        let mut app = app_for(temp.path(), &Config::default(), "@src/app.rs");
+        app.editor.set_cursor_char_offset(11).unwrap();
+        app.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+        activate_text(&mut app, "@src/app.rs");
+        wait_for(&mut app, |app| !app.reference_session.candidates().is_empty());
+
+        app.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        wait_for(&mut app, |app| !app.document.references().is_empty());
+        assert_eq!(app.editor.mode(), AdapterMode::Insert);
+
+        for _ in 0..2 {
+            app.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char(':'),
+                KeyModifiers::SHIFT,
+            )));
+        }
+        assert_eq!(app.document.text(), "@src/app.rs::");
+        assert_eq!(app.editor.command_line(), None);
+        assert_eq!(app.editor.mode(), AdapterMode::Insert);
+        assert_eq!(app.reference_session.active_kind(), Some(ReferenceKind::Symbol));
+    }
+
+    #[test]
     fn replace_mode_edits_form_one_history_group() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = app_for(temp.path(), &Config::default(), "abc");
