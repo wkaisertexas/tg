@@ -35,6 +35,14 @@ bench-prepare:
     test -d benchmarks/corpus/llvm-project/.git || git clone --depth 1 https://github.com/llvm/llvm-project.git benchmarks/corpus/llvm-project
     test -d benchmarks/corpus/ansible/.git || git clone --depth 1 https://github.com/ansible/ansible.git benchmarks/corpus/ansible
 
+perf-prepare:
+    mkdir -p benchmarks/corpus
+    test -d benchmarks/corpus/llvm-project-22.1.8/.git || git clone --depth 1 --branch llvmorg-22.1.8 https://github.com/llvm/llvm-project.git benchmarks/corpus/llvm-project-22.1.8
+    test "$(git -C benchmarks/corpus/llvm-project-22.1.8 rev-parse HEAD)" = "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"
+
+perf-check root="benchmarks/corpus/llvm-project-22.1.8":
+    TG_LLVM_ROOT="{{root}}" cargo test --locked --release --test performance -- --ignored --nocapture
+
 bench:
     cargo bench --bench repository
 

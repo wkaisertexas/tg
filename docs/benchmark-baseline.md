@@ -45,3 +45,22 @@ Reproduction commands:
 TG_BENCH_FILE_LIMIT=250 cargo bench --bench repository -- --save-baseline pre-migration
 TG_BENCH_FILE_LIMIT=250 cargo bench --bench repository -- --baseline pre-migration
 ```
+
+## Full LLVM sanity gate
+
+The release-mode sanity gate indexes every C and C++ source/header in LLVM
+22.1.8 at commit `ca7933e47d3a3451d81e72ac174dcb5aa28b59d1`. It requires at least
+60,000 files and 1,000,000 extracted symbols, then fails if indexing takes eight
+seconds or longer.
+
+```sh
+just perf-prepare
+just perf-check
+```
+
+The timed region excludes checkout and repository walking. Normal CI compiles
+the ignored test, while the absolute timing assertion runs on performance
+hardware: a standard shared GitHub runner measured 37.36 seconds for the same
+workload and cannot represent the eight-second workstation requirement. The
+Apple M4 Max reference run indexed 71,158 files and 1,456,878 symbols in 5.83
+seconds.
