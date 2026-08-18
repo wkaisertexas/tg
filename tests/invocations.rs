@@ -1,4 +1,6 @@
 use serde::Deserialize;
+use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Deserialize)]
@@ -9,6 +11,8 @@ struct Document {
 #[derive(Deserialize)]
 struct Case {
     id: String,
+    file: String,
+    source: String,
     submitted_prompt: String,
     selected: Selected,
     expected: Expected,
@@ -16,7 +20,6 @@ struct Case {
 
 #[derive(Deserialize)]
 struct Selected {
-    file: String,
     symbol: String,
     line: usize,
     column: usize,
@@ -36,16 +39,25 @@ struct ExpectedPreview {
 }
 
 #[test]
-fn every_documented_invocation_resolves_end_to_end() {
+fn every_documented_invocation_resolves_and_previews_on_a_clean_checkout() {
     let document: Document =
         serde_yaml::from_str(include_str!("../examples/invocations.yaml")).unwrap();
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::write(root.path().join(".gitignore"), "generated/\n").unwrap();
+
+    for case in &document.cases {
+        let path = root.path().join(&case.file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, &case.source).unwrap();
+    }
+
     for case in document.cases {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tg"));
         isolate_config(&mut command, home.path());
         let output = command
-            .current_dir(root)
+            .current_dir(root.path())
             .args(["--root", ".", "--resolve", &case.submitted_prompt])
             .output()
             .unwrap();
@@ -62,7 +74,7 @@ fn every_documented_invocation_resolves_end_to_end() {
             case.id
         );
 
-        let parsed = tscodeselection::language::parse(&root.join(&case.selected.file))
+        let parsed = tscodeselection::language::parse(&root.path().join(&case.file))
             .unwrap()
             .unwrap();
         let symbol = parsed
@@ -90,13 +102,15 @@ fn every_documented_invocation_resolves_end_to_end() {
         assert!(
             preview
                 .iter()
-                .any(|(line, _)| *line == case.expected.preview.focus_line)
+                .any(|(line, _)| *line == case.expected.preview.focus_line),
+            "{}",
+            case.id
         );
     }
 }
 
-fn isolate_config(command: &mut Command, home: &std::path::Path) {
-    command.env("HOME", home);
+fn isolate_config(command: &mut Command, home: &Path) {
+    command.env("HOME", home).env("TG_NO_PROJECT_CONFIG", "1");
     for name in [
         "XDG_CONFIG_HOME",
         "TG_CONFIG",
@@ -104,7 +118,6 @@ fn isolate_config(command: &mut Command, home: &std::path::Path) {
         "TG_TOKENIZER",
         "TG_GH_COMMAND",
         "TG_JIRA_COMMAND",
-        "TG_NO_PROJECT_CONFIG",
         "NO_COLOR",
     ] {
         command.env_remove(name);
