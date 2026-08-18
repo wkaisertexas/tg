@@ -2,7 +2,7 @@
 name = "tscodeselection"
 version = "0.1.0"
 edition = "2024"
-description = "A symbol-aware terminal file selector"
+description = "A Vim-like prompt editor with structured references"
 autobins = false
 
 [[bin]]

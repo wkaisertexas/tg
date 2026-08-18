@@ -19,3 +19,29 @@ repository walk, symbol index, and symbol query Criterion reports. Hardware,
 filesystem cache state, worker count, and moving upstream corpus revisions can
 materially affect absolute timings, so only like-for-like runs should be used
 to diagnose regressions.
+
+## Post-migration bounded comparison
+
+On 2026-08-17, the quick gate was run on an Apple M4 Max (`arm64`) against the
+same local shallow corpora and filesystem cache, with the pre-migration
+characterization commit `6d60e69` saved as a Criterion baseline. The
+post-migration working tree was based on `2c792fc`; each symbol index was capped
+at 250 source files. Values below are the Criterion interval midpoint.
+
+| Corpus | Walk before | Walk after | Index before | Index after | Query before | Query after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Rust | 670.59 ms | 111.94 ms | 48.28 ms | 45.03 ms | 395.05 us | 394.20 us |
+| LLVM | 2.168 s | 413.30 ms | 46.05 ms | 45.51 ms | 551.08 us | 547.95 us |
+| Ansible | 92.99 ms | 33.58 ms | 24.31 ms | 24.84 ms | 144.90 us | 145.63 us |
+
+Criterion classified every post-migration walk as improved (64-83%), Rust
+indexing as improved, and the remaining bounded index/query comparisons as no
+change. The walk improvement removes redundant per-file canonicalization while
+retaining non-followed symlink and exact-resolution containment tests.
+
+Reproduction commands:
+
+```sh
+TG_BENCH_FILE_LIMIT=250 cargo bench --bench repository -- --save-baseline pre-migration
+TG_BENCH_FILE_LIMIT=250 cargo bench --bench repository -- --baseline pre-migration
+```

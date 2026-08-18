@@ -25,6 +25,7 @@ jobs:
       - run: cargo test --locked --all-targets --all-features
       - run: cargo build --locked --release
       - run: python3 tests/release_smoke_test.py target/release/tg
+      - run: cargo bench --locked --bench repository
 
   nix:
     runs-on: ubuntu-24.04
