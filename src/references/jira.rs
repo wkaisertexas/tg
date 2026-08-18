@@ -625,7 +625,7 @@ esac
 
     #[test]
     fn numeric_and_explicit_keys_use_direct_raw_lookup_and_lower_cloud_urls() {
-        let (temp, provider) = fake_jira(500);
+        let (temp, provider) = fake_jira(5_000);
         let candidates = provider
             .query(request("42"), &CancellationFlag::default())
             .unwrap();
@@ -648,7 +648,7 @@ esac
 
     #[test]
     fn text_and_empty_queries_use_distinct_jql_arguments_and_rank_exactly() {
-        let (temp, provider) = fake_jira(500);
+        let (temp, provider) = fake_jira(5_000);
         let candidates = provider
             .query(request("Parser"), &CancellationFlag::default())
             .unwrap();
@@ -674,7 +674,7 @@ esac
 
     #[test]
     fn on_prem_urls_metadata_and_preview_are_supported() {
-        let (_temp, provider) = fake_jira(500);
+        let (_temp, provider) = fake_jira(5_000);
         let candidate = provider
             .query(request("fix"), &CancellationFlag::default())
             .unwrap()
@@ -721,7 +721,7 @@ esac
                 .unwrap()
                 .is_empty()
         );
-        let (_cancel_temp, cancellable) = fake_jira(500);
+        let (_cancel_temp, cancellable) = fake_jira(5_000);
         let active_cancel = CancellationFlag::default();
         let cancel_from_thread = active_cancel.clone();
         let cancel_thread = thread::spawn(move || {
@@ -736,7 +736,7 @@ esac
         );
         cancel_thread.join().unwrap();
 
-        let (_malformed_temp, malformed) = fake_jira(500);
+        let (_malformed_temp, malformed) = fake_jira(5_000);
         assert!(
             malformed
                 .query(request("MALFORMED"), &CancellationFlag::default())
@@ -759,7 +759,7 @@ esac
                 .contains("super-secret-token")
         );
 
-        let (_oversized_temp, oversized) = fake_jira(500);
+        let (_oversized_temp, oversized) = fake_jira(5_000);
         let oversized = oversized.with_output_cap(32);
         assert!(
             oversized
