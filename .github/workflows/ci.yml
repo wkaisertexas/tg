@@ -27,6 +27,23 @@ jobs:
       - run: python3 tests/release_smoke_test.py target/release/tg
       - run: cargo bench --locked --bench repository
 
+  performance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4
+        with:
+          repository: llvm/llvm-project
+          ref: ca7933e47d3a3451d81e72ac174dcb5aa28b59d1
+          path: benchmarks/corpus/llvm-project
+          fetch-depth: 1
+      - run: test "$(git -C benchmarks/corpus/llvm-project rev-parse HEAD)" = "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"
+      - run: cargo test --locked --release --test performance -- --ignored --nocapture
+        env:
+          TG_LLVM_ROOT: benchmarks/corpus/llvm-project
+
   nix:
     runs-on: ubuntu-24.04
     steps:
