@@ -162,11 +162,18 @@ Validate references, render the same lowered snapshot used by `:w`, and emit
 it with OSC 52. Stay open, retain friendly references, and do not alter dirty
 state. The status line briefly reports the copied byte and token counts.
 
+### `:r !command`
+
+Run the explicitly typed command through Bash off the UI thread and insert its
+UTF-8 stdout below the current line as one undoable edit. Output is bounded,
+execution times out, failures do not modify the document, and project
+configuration cannot supply commands.
+
 ### Future commands
 
-`:set`, filename-changing `:w path`, multiple buffers, shell commands, and Vim
-configuration sourcing are deferred. Product settings belong in TOML rather
-than a Vimscript-compatible command language.
+`:set`, filename-changing `:w path`, multiple buffers, and Vim configuration
+sourcing are deferred. Product settings belong in TOML rather than a
+Vimscript-compatible command language.
 
 ## 7. Lowered Snapshot Rendering
 
