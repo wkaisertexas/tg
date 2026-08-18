@@ -62,6 +62,9 @@ struct App {
     should_exit: bool,
     refs_total: ContextTotal,
     edit_group_active: bool,
+    help_lines: Vec<String>,
+    help_pending: bool,
+    help_visible: bool,
 }
 
 impl App {
@@ -161,6 +164,9 @@ impl App {
             should_exit: false,
             refs_total: ContextTotal::default(),
             edit_group_active: false,
+            help_lines: config_help_lines(config),
+            help_pending: false,
+            help_visible: false,
         })
     }
 
@@ -424,7 +430,42 @@ impl App {
         }
     }
 
+    fn handle_help_key(&mut self, key: event::KeyEvent) -> bool {
+        if self.help_visible {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?')) {
+                self.help_visible = false;
+            }
+            return true;
+        }
+        if self.editor.mode() != AdapterMode::Normal {
+            self.help_pending = false;
+            return false;
+        }
+        if self.help_pending {
+            self.help_pending = false;
+            if key.code == KeyCode::Char('?')
+                && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+            {
+                self.help_visible = true;
+                self.reference_session.close();
+                self.preview = None;
+                return true;
+            }
+        }
+        if key.code == KeyCode::Char(' ') && key.modifiers.is_empty() {
+            self.help_pending = true;
+            return true;
+        }
+        false
+    }
+
     fn handle_event(&mut self, event: Event) {
+        if let Event::Key(key) = event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && self.handle_help_key(key)
+        {
+            return;
+        }
         if let Event::Key(key) = event
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && self.completion_active()
@@ -657,6 +698,76 @@ fn status_text(app: &App, width: u16) -> String {
     }
 }
 
+fn config_help_lines(config: &Config) -> Vec<String> {
+    vec![
+        "Keys: Space ? help · Esc/q/? close".into(),
+        "Completion: Tab/Enter accept · Up/Down or Ctrl-J/Ctrl-K select".into(),
+        format!("Preview: {}", config.ui.preview_toggle),
+        format!(
+            "Commands: :w · :q · :q! · :wq · {}",
+            config.editor.copy_command
+        ),
+        format!(
+            "[leaders] files={:?} broad_files={:?} symbols={:?}",
+            config.leaders.files, config.leaders.broad_files, config.leaders.symbols
+        ),
+        format!(
+            "[leaders] skills={:?} github_issues={:?} github_pull_requests={:?} jira_issues={:?}",
+            config.leaders.skills,
+            config.leaders.github_issues,
+            config.leaders.github_pull_requests,
+            config.leaders.jira_issues
+        ),
+        format!(
+            "[editor] line_numbers={} current_line_absolute={} tab_width={} wrap={}",
+            format!("{:?}", config.editor.line_numbers).to_ascii_lowercase(),
+            config.editor.current_line_absolute,
+            config.editor.tab_width,
+            config.editor.wrap
+        ),
+        format!(
+            "[ui] preview={} color={} completion={}x{}%",
+            format!("{:?}", config.ui.preview).to_ascii_lowercase(),
+            format!("{:?}", config.ui.color).to_ascii_lowercase(),
+            config.ui.completion_height,
+            config.ui.completion_width_percent
+        ),
+        format!(
+            "[search] limit={} debounce_ms={} broad_excludes={:?}",
+            config.search.limit, config.search.debounce_ms, config.search.broad_excludes
+        ),
+        format!(
+            "[tokens] tokenizer={:?} decimals={} file={} symbol={} total={}",
+            config.tokens.tokenizer,
+            config.tokens.decimals,
+            config.tokens.show_file,
+            config.tokens.show_symbol,
+            config.tokens.show_total
+        ),
+        format!(
+            "[skills] profile={:?} mention={:?} roots={}",
+            config.skills.profile,
+            config.skills.mention,
+            config.skills.roots.len()
+        ),
+        format!(
+            "[providers.github] enabled={} command={} limit={} timeout_ms={}",
+            config.providers.github.enabled,
+            config.providers.github.command.display(),
+            config.providers.github.limit,
+            config.providers.github.timeout_ms
+        ),
+        format!(
+            "[providers.jira] enabled={} command={} key_prefix={:?} limit={} timeout_ms={}",
+            config.providers.jira.enabled,
+            config.providers.jira.command.display(),
+            config.providers.jira.key_prefix,
+            config.providers.jira.limit,
+            config.providers.jira.timeout_ms
+        ),
+    ]
+}
+
 fn preview_lines(app: &App) -> Vec<Line<'static>> {
     let selected = app.reference_session.selected();
     let Some(cached) = app
@@ -776,6 +887,21 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 columns[1],
             );
         }
+    }
+    if app.help_visible {
+        let height = u16::try_from(app.help_lines.len() + 2).unwrap_or(u16::MAX);
+        let area = overlay_area(rows[0], 90, height);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(app.help_lines.join("\n"))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Configuration · Esc/q/? to close "),
+                ),
+            area,
+        );
     }
 }
 
@@ -932,7 +1058,9 @@ mod tests {
             KeyModifiers::NONE,
         )));
         activate_text(&mut app, "@src/app.rs");
-        wait_for(&mut app, |app| !app.reference_session.candidates().is_empty());
+        wait_for(&mut app, |app| {
+            !app.reference_session.candidates().is_empty()
+        });
 
         app.handle_event(Event::Key(event::KeyEvent::new(
             KeyCode::Tab,
@@ -950,7 +1078,61 @@ mod tests {
         assert_eq!(app.document.text(), "@src/app.rs::");
         assert_eq!(app.editor.command_line(), None);
         assert_eq!(app.editor.mode(), AdapterMode::Insert);
-        assert_eq!(app.reference_session.active_kind(), Some(ReferenceKind::Symbol));
+        assert_eq!(
+            app.reference_session.active_kind(),
+            Some(ReferenceKind::Symbol)
+        );
+    }
+
+    #[test]
+    fn space_question_opens_modal_configuration_help() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.leaders.files = "~f".into();
+        config.ui.preview_toggle = "ctrl-x".into();
+        config.providers.jira.key_prefix = Some("OPS".into());
+        let mut app = app_for(temp.path(), &config, "unchanged");
+        let press = |app: &mut App, code, modifiers| {
+            app.handle_event(Event::Key(event::KeyEvent::new(code, modifiers)));
+        };
+
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.help_pending);
+        assert!(!app.help_visible);
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::SHIFT);
+        assert!(app.help_visible);
+        assert!(!app.help_pending);
+        assert!(
+            app.help_lines
+                .iter()
+                .any(|line| line.contains("files=\"~f\""))
+        );
+        assert!(app.help_lines.iter().any(|line| line == "Preview: ctrl-x"));
+        assert!(
+            app.help_lines
+                .iter()
+                .any(|line| line.contains("key_prefix=Some(\"OPS\")"))
+        );
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..24 {
+            for x in 0..100 {
+                rendered.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        assert!(rendered.contains("Configuration · Esc/q/? to close"));
+        assert!(rendered.contains("[leaders] files=\"~f\""));
+
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(app.help_visible);
+        assert_eq!(app.editor.mode(), AdapterMode::Normal);
+        assert_eq!(app.document.text(), "unchanged");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.help_visible);
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(app.editor.mode(), AdapterMode::Insert);
     }
 
     #[test]
