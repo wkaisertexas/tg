@@ -1,265 +1,66 @@
-version: 1
+version: 2
 
 description: >-
-  Interactive MVP examples backed by shallow clones in the ignored corpus
-  directory. Locations are pinned to the recorded commits and use one-based
-  byte columns. Each case starts the REPL from the tscodeselection repository
-  root, selects the displayed reference, and submits the prompt.
+  Current, hermetic examples for deterministic prompt lowering. The integration
+  suite materializes these small sources in a temporary repository, so the
+  examples run on a clean checkout without downloading external corpora.
 
 command:
-  program: tscodeselection
-  argv:
-    - .
-  working_directory: repository_root
+  program: tg
+  usage: "tg --root FIXTURE_ROOT --resolve PROMPT"
   output_format: plain_text
 
-corpus:
-  - id: flask
-    language: python
-    path: corpus/python/flask
-    repository: https://github.com/pallets/flask.git
-    commit: 6a2f545bfd8ed31e19066a299296917e034aca58
-    clone_depth: 1
-
-  - id: requests
-    language: python
-    path: corpus/python/requests
-    repository: https://github.com/psf/requests.git
-    commit: 1f6589ec3a1ee910f9a65cc3ceac60b26677bc0e
-    clone_depth: 1
-
-  - id: fmt
-    language: cpp
-    path: corpus/cpp/fmt
-    repository: https://github.com/fmtlib/fmt.git
-    commit: a245c6de992168642562395988e0a035dc3ecc01
-    clone_depth: 1
-
-  - id: nlohmann_json
-    language: cpp
-    path: corpus/cpp/json
-    repository: https://github.com/nlohmann/json.git
-    commit: 3c0a9a99fd516be4264b10015461384b60f5cc97
-    clone_depth: 1
-
 cases:
-  - id: python_flask_class
+  - id: ignored_python_method_through_broad_file_provider
     language: python
-    corpus: flask
-    file_query: flask/app.py
-    symbol_query: Flask
-    submitted_prompt: "Inspect %corpus/python/flask/src/flask/app.py::Flask"
-    selected:
-      display_reference: "%corpus/python/flask/src/flask/app.py::Flask"
-      file: corpus/python/flask/src/flask/app.py
-      symbol: Flask
-      kind: class
-      line: 109
-      column: 7
-    expected:
-      lowered_reference: corpus/python/flask/src/flask/app.py::109:7 Flask
-      stdout: "Inspect corpus/python/flask/src/flask/app.py::109:7 Flask\n"
-      preview:
-        header: corpus/python/flask/src/flask/app.py
-        focus_line: 109
-        first_line: 104
-        last_line: 114
+    file: generated/widget.py
+    source: |
+      # Generated fixture intentionally ignored by Git.
 
-  - id: python_flask_nested_method
-    language: python
-    corpus: flask
-    file_query: flask/app.py
-    symbol_query: run
-    submitted_prompt: "Explain startup behavior in %corpus/python/flask/src/flask/app.py::run"
+      class Widget:
+          def render(self):
+              value = 'rendered'
+              return value
+
+          def reset(self):
+              return None
+
+      # End fixture.
+    submitted_prompt: "Inspect %generated/widget.py::render"
     selected:
-      display_reference: "%corpus/python/flask/src/flask/app.py::run"
-      file: corpus/python/flask/src/flask/app.py
-      symbol: run
-      qualified_symbol: Flask::run
-      kind: method
-      line: 632
+      symbol: render
+      line: 4
       column: 9
     expected:
-      lowered_reference: corpus/python/flask/src/flask/app.py::632:9 run
-      stdout: "Explain startup behavior in corpus/python/flask/src/flask/app.py::632:9 run\n"
+      stdout: "Inspect generated/widget.py::4:9 render\n"
       preview:
-        header: corpus/python/flask/src/flask/app.py
-        focus_line: 632
-        first_line: 627
-        last_line: 637
+        first_line: 1
+        last_line: 9
+        focus_line: 4
 
-  - id: python_flask_blueprint_class
-    language: python
-    corpus: flask
-    file_query: flask/blueprints.py
-    symbol_query: Blueprint
-    submitted_prompt: "Review %corpus/python/flask/src/flask/blueprints.py::Blueprint"
-    selected:
-      display_reference: "%corpus/python/flask/src/flask/blueprints.py::Blueprint"
-      file: corpus/python/flask/src/flask/blueprints.py
-      symbol: Blueprint
-      kind: class
-      line: 18
-      column: 7
-    expected:
-      lowered_reference: corpus/python/flask/src/flask/blueprints.py::18:7 Blueprint
-      stdout: "Review corpus/python/flask/src/flask/blueprints.py::18:7 Blueprint\n"
-      preview:
-        header: corpus/python/flask/src/flask/blueprints.py
-        focus_line: 18
-        first_line: 13
-        last_line: 23
+  - id: visible_rust_function_through_git_aware_file_provider
+    language: rust
+    file: src/worker.rs
+    source: |
+      // Checked-in fixture.
 
-  - id: python_requests_function
-    language: python
-    corpus: requests
-    file_query: requests/api.py
-    symbol_query: request
-    submitted_prompt: "Trace %corpus/python/requests/src/requests/api.py::request"
-    selected:
-      display_reference: "%corpus/python/requests/src/requests/api.py::request"
-      file: corpus/python/requests/src/requests/api.py
-      symbol: request
-      kind: function
-      line: 24
-      column: 5
-    expected:
-      lowered_reference: corpus/python/requests/src/requests/api.py::24:5 request
-      stdout: "Trace corpus/python/requests/src/requests/api.py::24:5 request\n"
-      preview:
-        header: corpus/python/requests/src/requests/api.py
-        focus_line: 24
-        first_line: 19
-        last_line: 29
+      pub struct Worker;
 
-  - id: python_requests_response_class
-    language: python
-    corpus: requests
-    file_query: requests/models.py
-    symbol_query: Response
-    submitted_prompt: "Check response handling in %corpus/python/requests/src/requests/models.py::Response"
-    selected:
-      display_reference: "%corpus/python/requests/src/requests/models.py::Response"
-      file: corpus/python/requests/src/requests/models.py
-      symbol: Response
-      kind: class
-      line: 732
-      column: 7
-    expected:
-      lowered_reference: corpus/python/requests/src/requests/models.py::732:7 Response
-      stdout: "Check response handling in corpus/python/requests/src/requests/models.py::732:7 Response\n"
-      preview:
-        header: corpus/python/requests/src/requests/models.py
-        focus_line: 732
-        first_line: 727
-        last_line: 737
+      impl Worker {
+          pub fn execute(&self) -> bool {
+              true
+          }
+      }
 
-  - id: cpp_fmt_basic_string_view
-    language: cpp
-    corpus: fmt
-    file_query: fmt/base.h
-    symbol_query: basic_string_view
-    submitted_prompt: "Inspect %corpus/cpp/fmt/include/fmt/base.h::basic_string_view"
+      // End fixture.
+    submitted_prompt: "Trace @src/worker.rs::execute"
     selected:
-      display_reference: "%corpus/cpp/fmt/include/fmt/base.h::basic_string_view"
-      file: corpus/cpp/fmt/include/fmt/base.h
-      symbol: basic_string_view
-      kind: class
-      line: 521
-      column: 32
+      symbol: execute
+      line: 6
+      column: 12
     expected:
-      lowered_reference: corpus/cpp/fmt/include/fmt/base.h::521:32 basic_string_view
-      stdout: "Inspect corpus/cpp/fmt/include/fmt/base.h::521:32 basic_string_view\n"
+      stdout: "Trace src/worker.rs::6:12 execute\n"
       preview:
-        header: corpus/cpp/fmt/include/fmt/base.h
-        focus_line: 521
-        first_line: 516
-        last_line: 526
-
-  - id: cpp_fmt_named_arg_struct
-    language: cpp
-    corpus: fmt
-    file_query: fmt/base.h
-    symbol_query: named_arg
-    submitted_prompt: "Explain %corpus/cpp/fmt/include/fmt/base.h::named_arg"
-    selected:
-      display_reference: "%corpus/cpp/fmt/include/fmt/base.h::named_arg"
-      file: corpus/cpp/fmt/include/fmt/base.h
-      symbol: named_arg
-      kind: struct
-      line: 1066
-      column: 52
-    expected:
-      lowered_reference: corpus/cpp/fmt/include/fmt/base.h::1066:52 named_arg
-      stdout: "Explain corpus/cpp/fmt/include/fmt/base.h::1066:52 named_arg\n"
-      preview:
-        header: corpus/cpp/fmt/include/fmt/base.h
-        focus_line: 1066
-        first_line: 1061
-        last_line: 1071
-
-  - id: cpp_json_basic_json_class
-    language: cpp
-    corpus: nlohmann_json
-    file_query: nlohmann/json.hpp
-    symbol_query: basic_json
-    submitted_prompt: "Review %corpus/cpp/json/include/nlohmann/json.hpp::basic_json"
-    selected:
-      display_reference: "%corpus/cpp/json/include/nlohmann/json.hpp::basic_json"
-      file: corpus/cpp/json/include/nlohmann/json.hpp
-      symbol: basic_json
-      kind: class
-      line: 127
-      column: 7
-    expected:
-      lowered_reference: corpus/cpp/json/include/nlohmann/json.hpp::127:7 basic_json
-      stdout: "Review corpus/cpp/json/include/nlohmann/json.hpp::127:7 basic_json\n"
-      preview:
-        header: corpus/cpp/json/include/nlohmann/json.hpp
-        focus_line: 127
-        first_line: 122
-        last_line: 132
-
-  - id: cpp_json_pointer_class
-    language: cpp
-    corpus: nlohmann_json
-    file_query: detail/json_pointer.hpp
-    symbol_query: json_pointer
-    submitted_prompt: "Trace %corpus/cpp/json/include/nlohmann/detail/json_pointer.hpp::json_pointer"
-    selected:
-      display_reference: "%corpus/cpp/json/include/nlohmann/detail/json_pointer.hpp::json_pointer"
-      file: corpus/cpp/json/include/nlohmann/detail/json_pointer.hpp
-      symbol: json_pointer
-      kind: class
-      line: 35
-      column: 7
-    expected:
-      lowered_reference: corpus/cpp/json/include/nlohmann/detail/json_pointer.hpp::35:7 json_pointer
-      stdout: "Trace corpus/cpp/json/include/nlohmann/detail/json_pointer.hpp::35:7 json_pointer\n"
-      preview:
-        header: corpus/cpp/json/include/nlohmann/detail/json_pointer.hpp
-        focus_line: 35
-        first_line: 30
-        last_line: 40
-
-  - id: cpp_json_lexer_class
-    language: cpp
-    corpus: nlohmann_json
-    file_query: detail/input/lexer.hpp
-    symbol_query: lexer
-    submitted_prompt: "Check tokenization in %corpus/cpp/json/include/nlohmann/detail/input/lexer.hpp::lexer"
-    selected:
-      display_reference: "%corpus/cpp/json/include/nlohmann/detail/input/lexer.hpp::lexer"
-      file: corpus/cpp/json/include/nlohmann/detail/input/lexer.hpp
-      symbol: lexer
-      kind: class
-      line: 134
-      column: 7
-    expected:
-      lowered_reference: corpus/cpp/json/include/nlohmann/detail/input/lexer.hpp::134:7 lexer
-      stdout: "Check tokenization in corpus/cpp/json/include/nlohmann/detail/input/lexer.hpp::134:7 lexer\n"
-      preview:
-        header: corpus/cpp/json/include/nlohmann/detail/input/lexer.hpp
-        focus_line: 134
-        first_line: 129
-        last_line: 139
+        first_line: 1
+        last_line: 11
+        focus_line: 6

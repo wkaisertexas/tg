@@ -1,24 +1,7 @@
+mod cli;
+
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
-
-#[derive(Parser)]
-#[command(version, about)]
-struct Cli {
-    /// Directory inside the project to search.
-    root_folder: Option<PathBuf>,
-    /// Resolve one prompt without opening the TUI (useful for scripts/tests).
-    #[arg(long)]
-    resolve: Option<String>,
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Replace this executable with the latest verified GitHub release.
-    Update,
-}
+use cli::Cli;
 
 fn main() {
     if let Err(error) = real_main() {
@@ -28,15 +11,47 @@ fn main() {
 }
 
 fn real_main() -> Result<()> {
-    let cli = Cli::parse();
-    if matches!(cli.command, Some(Command::Update)) {
+    let cli = Cli::parse_process();
+    if cli.requests_update() {
         return tscodeselection::updater::update();
     }
-    let root_folder = cli.root_folder.context("a root folder is required")?;
-    let repository = tscodeselection::repository::Repository::discover(&root_folder)?;
+
+    let cwd = std::env::current_dir().context("cannot determine current working directory")?;
+    // File validation deliberately precedes terminal setup. Invalid UTF-8,
+    // directories, and missing parents therefore cannot leave raw mode active.
+    let (document, save_target) = match cli.file() {
+        Some(path) => {
+            let opened = tscodeselection::editor::save::SaveTarget::open(path)
+                .with_context(|| format!("could not open document {}", path.display()))?;
+            let existed = opened.target.existed_at_baseline();
+            let document = tscodeselection::editor::Document::from_opened_bytes(
+                opened.target.logical_path(),
+                opened.bytes,
+                existed,
+            )
+            .with_context(|| format!("could not decode document {}", path.display()))?;
+            (document, Some(opened.target))
+        }
+        None => (tscodeselection::editor::Document::unnamed(), None),
+    };
+    let environment_root = std::env::var_os("TG_ROOT");
+    let repository = tscodeselection::repository::Repository::for_editor(
+        cli.explicit_root(),
+        environment_root.as_deref().map(std::path::Path::new),
+        &cwd,
+        cli.file(),
+    )?;
+    let config_inputs = cli.config_inputs(&cwd, &repository.search_root);
+    let loaded_config =
+        tscodeselection::config::load(&config_inputs).context("could not load configuration")?;
+
     if let Some(prompt) = cli.resolve {
-        let lowered = tscodeselection::composer::resolve_prompt(&repository.search_root, &prompt)
-            .context("could not resolve prompt")?;
+        let lowered = tscodeselection::composer::resolve_prompt_with_config(
+            &repository,
+            &loaded_config.config,
+            &prompt,
+        )
+        .context("could not resolve prompt")?;
         println!("{lowered}");
         return Ok(());
     }
@@ -44,5 +59,10 @@ fn real_main() -> Result<()> {
         tscodeselection::app::is_terminal(),
         "interactive mode requires a terminal; use --resolve for headless operation"
     );
-    tscodeselection::app::run(repository)
+    tscodeselection::app::run(tscodeselection::app::Startup {
+        repository,
+        config: loaded_config.config,
+        document,
+        save_target,
+    })
 }

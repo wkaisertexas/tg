@@ -2,7 +2,7 @@
 name = "tscodeselection"
 version = "0.1.0"
 edition = "2024"
-description = "A symbol-aware terminal file selector"
+description = "A Vim-like prompt editor with structured references"
 autobins = false
 
 [[bin]]
@@ -14,22 +14,36 @@ anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
+edtui = { version = "0.11.7", default-features = false }
 fuzzy-matcher = "0.3"
 ignore = "0.4"
-ratatui = "0.29"
+ratatui = "0.30"
 rayon = "1"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+serde_yaml = "0.9"
 sha2 = "0.10"
+toml = "0.9"
+tiktoken-rs = "0.12"
 tree-sitter = "0.25"
+tree-sitter-bash = "0.25.1"
 tree-sitter-c = "0.24"
+tree-sitter-c-sharp = "0.23.5"
 tree-sitter-cpp = "0.23"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.23"
 tree-sitter-rust = "0.24"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-typescript = "0.23.2"
 
 [dev-dependencies]
 assert_cmd = "2"
+portable-pty = "0.9"
 serde_yaml = "0.9"
 tempfile = "3"
 criterion = "0.7"

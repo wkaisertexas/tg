@@ -1,0 +1,66 @@
+version = 1
+
+[editor]
+line_numbers = "absolute"
+current_line_absolute = false
+tab_width = 2
+wrap = false
+copy_command = ":copy"
+
+[ui]
+preview = "automatic"
+preview_toggle = "ctrl-o"
+completion_height = 10
+completion_width_percent = 70
+status_timeout_ms = 3000
+color = "never"
+
+[leaders]
+files = "@@"
+broad_files = "%%"
+symbols = "::"
+skills = "$$"
+github_issues = "##"
+github_pull_requests = "!!"
+jira_issues = "&&"
+
+[search]
+limit = 75
+debounce_ms = 50
+broad_excludes = [".git", "target"]
+
+[tokens]
+tokenizer = "gpt-4o"
+decimals = 2
+show_file = false
+show_symbol = false
+show_total = false
+
+[skills]
+profile = "codex-local"
+mention = "${leader}${name}"
+read_codex_disable_rules = false
+
+[[skills.roots]]
+path = "~/company-agent/skills"
+scope = "user"
+discovery = "recursive"
+walk_ancestors = true
+contained = false
+metadata = "SKILL.md"
+name_key = "name"
+description_key = "description"
+mention = "skill:${name}"
+
+[providers.github]
+enabled = false
+command = "/opt/bin/gh"
+limit = 25
+timeout_ms = 4000
+
+[providers.jira]
+enabled = false
+command = "/opt/bin/jira"
+key_prefix = "g5-"
+limit = 30
+timeout_ms = 4500
