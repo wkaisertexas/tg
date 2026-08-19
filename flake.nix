@@ -13,6 +13,7 @@
         "x86_64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      cargoManifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
     in
     {
       packages = forAllSystems (
@@ -23,10 +24,12 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "tg";
-            version = "0.1.0";
+            version = cargoManifest.package.version;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             doCheck = true;
+            nativeCheckInputs = [ pkgs.python3 ];
+            postCheck = "python3 tests/test_bump_version.py";
             meta.mainProgram = "tg";
           };
         }
@@ -44,6 +47,7 @@
               cargo
               clippy
               just
+              python3
               rustc
               rustfmt
             ];
