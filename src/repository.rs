@@ -117,8 +117,13 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn discovers_this_repository_from_nested_directory() {
-        let repo = Repository::discover(Path::new("docs")).unwrap();
+    fn discovers_repository_from_nested_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".git")).unwrap();
+        fs::create_dir(temp.path().join("docs")).unwrap();
+        fs::write(temp.path().join("docs/spec.md"), "spec").unwrap();
+
+        let repo = Repository::discover(&temp.path().join("docs")).unwrap();
         assert!(repo.git_aware);
         assert_eq!(
             repo.relative(&repo.search_root.join("docs/spec.md"))

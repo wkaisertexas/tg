@@ -26,6 +26,8 @@ just check
 ```
 ## Install and run
 ```sh
+nix profile install github:wkaisertexas/tg
+# Or install the latest release binary without Nix:
 curl -fsSL https://raw.githubusercontent.com/wkaisertexas/tg/main/install.sh | sh
 tg README.md
 tg --root . prompts/task.md
