@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "onboarding": "tg starts in Vim Normal mode. Use i to insert; @ searches files; extend an accepted file with :: for symbols; standalone :: searches repository symbols. Tab or Enter accepts; Escape dismisses; Ctrl-P toggles preview; Space then ? in Normal mode opens help. Save with :w or :wq. The harness captures :copy locally.",
+  "scenarios": [
+    {
+      "id": "file-to-symbol",
+      "goal": "Write a prompt asking an agent to inspect validate_order from src/orders.rs, including only that function rather than the whole file. Inspect the choices before selecting. Save the prompt.",
+      "success": "Saved output identifies the non-legacy validate_order symbol, and surrounding prompt text is preserved."
+    },
+    {
+      "id": "browse-beyond-first-page",
+      "goal": "Browse the functions in src/orders.rs and choose dispatch_order. Navigate through the list rather than filtering directly to the name. Inspect its preview, accept it, and save.",
+      "success": "The non-legacy dispatch_order reference is saved. Record whether the selected result remains identifiable while navigating."
+    },
+    {
+      "id": "repository-disambiguation",
+      "goal": "Starting from a repository-wide symbol search, find dispatch_order from src/orders.rs, not src/legacy/orders.rs. Inspect enough context to choose confidently.",
+      "success": "The selected reference belongs to src/orders.rs."
+    },
+    {
+      "id": "narrow-preview",
+      "goal": "Find describe_international_shipping_restrictions in src/orders.rs and inspect its preview. Repeat after resizing to 80x24 and 40x8, then restore 120x30.",
+      "success": "The intended symbol can be identified and selected without losing the prompt."
+    },
+    {
+      "id": "recover-and-copy",
+      "goal": "Begin a file reference, cancel the completion, retry, accept a symbol, undo and redo the acceptance, then copy and save the completed prompt.",
+      "success": "Final copied text equals saved output, with no unintended completion text or duplicated content."
+    },
+    {
+      "id": "empty-and-error",
+      "goal": "Search for a nonexistent file, recover, then search GitHub issues in a session started with --provider-error. Determine what failed and continue editing a normal prompt.",
+      "success": "The editor remains usable, and visible feedback distinguishes failure from an empty or loading result."
+    },
+    {
+      "id": "ignored-file",
+      "goal": "Reference generated/status.txt, which is ignored by Git, using the broad-file search. Save the result.",
+      "success": "The ignored file can be deliberately referenced without making it appear in Git-aware search."
+    }
+  ],
+  "matrix": {
+    "baseline": {"cols": 120, "rows": 30},
+    "variants": ["80x24", "40x8", "preview on/off", "--no-color"]
+  }
+}

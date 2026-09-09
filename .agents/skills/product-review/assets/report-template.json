@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "mode": "calibration",
+  "summary": "Replace with a concise description of this local review.",
+  "tasks": [],
+  "matrix": [],
+  "limitations": [],
+  "findings": [],
+  "finding_shape": {
+    "id": "surface-scope-behavior",
+    "title": "Concise observed problem",
+    "category": "usability",
+    "scope": "Affected task and UI scope",
+    "severity": "medium",
+    "confidence": "high",
+    "observed": "Only directly supported observations",
+    "impact_hypothesis": "Why this may make the task harder",
+    "reproduction": ["Specific steps from a fresh fixture session"],
+    "evidence": [{"session": "/absolute/path/returned/by/start", "frame": 1}],
+    "proposal": "Smallest useful change",
+    "counterexamples": ["Conditions where the existing behavior is useful or the claim does not apply"],
+    "acceptance_criteria": ["Observable behavior to verify after an approved change"],
+    "decision": "unreviewed",
+    "decision_rationale": "",
+    "code": []
+  }
+}
