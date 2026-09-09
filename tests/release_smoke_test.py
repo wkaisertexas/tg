@@ -29,24 +29,14 @@ class SmokeFailure(RuntimeError):
 
 
 def isolated_environment(home: Path) -> dict[str, str]:
-    env = os.environ.copy()
-    for name in (
-        "TG_CONFIG",
-        "TG_GH_COMMAND",
-        "TG_JIRA_COMMAND",
-        "TG_ROOT",
-        "TG_TOKENIZER",
-        "XDG_CONFIG_HOME",
-    ):
-        env.pop(name, None)
-    env.update(
-        {
-            "HOME": str(home),
-            "TERM": "xterm-256color",
-            "TG_NO_PROJECT_CONFIG": "1",
-        }
-    )
-    return env
+    return {
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "PATH": "/usr/bin:/bin",
+        "TERM": "xterm-256color",
+        "LANG": "en_US.UTF-8",
+        "TG_NO_PROJECT_CONFIG": "1",
+    }
 
 
 def run(
@@ -160,7 +150,7 @@ def test_version(binary: Path) -> None:
 def test_help(binary: Path) -> None:
     result = run([str(binary), "--help"], cwd=ROOT, env=os.environ.copy())
     require_success(result, "help check")
-    for expected in ("Usage: tg", "--resolve", "update"):
+    for expected in ("Usage: tg", "--resolve", "update", "setup", "doctor"):
         if expected not in result.stdout:
             raise SmokeFailure(f"help output did not contain {expected!r}")
 
@@ -230,6 +220,47 @@ def test_external_editor_parent(binary: Path) -> None:
         )
 
 
+def test_setup(binary: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="tg-smoke-setup-") as directory:
+        root = Path(directory)
+        home = root / "home"
+        home.mkdir()
+        return_code, output = run_pty(
+            [str(binary), "setup", "--no-color"],
+            cwd=root,
+            env=isolated_environment(home),
+            input_chunks=[b"?", b"q", b"c", b"q", b"q"],
+        )
+        if return_code != 0:
+            raise SmokeFailure(f"setup exited {return_code}")
+        for label in (b"References", b"connections", b"GitHub", b"Jira"):
+            if label not in output:
+                raise SmokeFailure(f"setup did not show {label!r}; terminal output: {output!r}")
+        if b"\x1b[?1049h" not in output or b"\x1b[?1049l" not in output:
+            raise SmokeFailure("setup did not restore the alternate screen")
+        if set(root.iterdir()) != {home}:
+            raise SmokeFailure("setup unexpectedly created files")
+
+
+def test_provider_view_preserves_prompt(binary: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="tg-smoke-providers-") as directory:
+        root = Path(directory)
+        home = root / "home"
+        home.mkdir()
+        prompt = root / "prompt.md"
+        prompt.write_text("Keep this prompt", encoding="utf-8")
+        return_code, output = run_pty(
+            [str(binary), str(prompt)],
+            cwd=root,
+            env=isolated_environment(home),
+            input_chunks=[b":providers\r", b"\x1b[200~not part of the prompt\x1b[201~", b"q", b":wq\r"],
+        )
+        assert_editor_result(return_code=return_code, output=output, prompt=prompt,
+                             expected="Keep this prompt", context="provider view")
+        if b"connections" not in output:
+            raise SmokeFailure("provider view was not opened")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path, help="path to the built tg executable")
@@ -241,6 +272,8 @@ def main() -> int:
     checks = (
         ("version", test_version),
         ("help", test_help),
+        ("setup onboarding", test_setup),
+        ("provider view preserves prompt", test_provider_view_preserves_prompt),
         ("headless resolution", test_headless_resolution),
         ("direct PTY editing", test_direct_editor),
         ("external-editor parent invocation", test_external_editor_parent),

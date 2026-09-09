@@ -1,19 +1,24 @@
 mod cli;
 
 use anyhow::{Context, Result};
-use cli::Cli;
+use cli::{Cli, Command};
+use std::process::ExitCode;
 
-fn main() {
-    if let Err(error) = real_main() {
-        eprintln!("error: {error:#}");
-        std::process::exit(2);
+fn main() -> ExitCode {
+    match real_main() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::from(2)
+        }
     }
 }
 
-fn real_main() -> Result<()> {
+fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse_process();
     if cli.requests_update() {
-        return tscodeselection::updater::update();
+        tscodeselection::updater::update()?;
+        return Ok(ExitCode::SUCCESS);
     }
 
     let cwd = std::env::current_dir().context("cannot determine current working directory")?;
@@ -42,9 +47,34 @@ fn real_main() -> Result<()> {
         cli.file(),
     )?;
     let config_inputs = cli.config_inputs(&cwd, &repository.search_root);
-    let loaded_config =
-        tscodeselection::config::load(&config_inputs).context("could not load configuration")?;
+    let loaded_config = tscodeselection::config::load(&config_inputs).context(
+        "could not load configuration; fix the file/key below. Use --no-project-config to bypass project settings, or --config FILE to select a different user configuration",
+    )?;
 
+    match cli.command() {
+        Some(Command::Doctor { check, json }) => {
+            let failed = tscodeselection::onboarding::doctor(
+                &repository,
+                &loaded_config,
+                check.as_deref(),
+                *json,
+            )?;
+            return Ok(if failed {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            });
+        }
+        Some(Command::Setup) => {
+            if tscodeselection::app::is_terminal() {
+                tscodeselection::onboarding::run(repository, loaded_config)?;
+            } else {
+                tscodeselection::onboarding::doctor(&repository, &loaded_config, None, false)?;
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        _ => {}
+    }
     if let Some(prompt) = cli.resolve {
         let lowered = tscodeselection::composer::resolve_prompt_with_config(
             &repository,
@@ -53,16 +83,17 @@ fn real_main() -> Result<()> {
         )
         .context("could not resolve prompt")?;
         println!("{lowered}");
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     anyhow::ensure!(
         tscodeselection::app::is_terminal(),
-        "interactive mode requires a terminal; use --resolve for headless operation"
+        "interactive mode requires a terminal; use --resolve for headless operation or `tg doctor` for setup diagnostics"
     );
     tscodeselection::app::run(tscodeselection::app::Startup {
         repository,
-        config: loaded_config.config,
+        config: loaded_config,
         document,
         save_target,
-    })
+    })?;
+    Ok(ExitCode::SUCCESS)
 }

@@ -1,7 +1,8 @@
-use crate::config::{ColorMode, Config, LeadersConfig, PreviewMode, TokenConfig};
+use crate::config::{ColorMode, Config, LeadersConfig, LoadedConfig, PreviewMode, TokenConfig};
 use crate::editor::command::{CommandDispatcher, CommandEffect, LowerRequest};
 use crate::editor::save::{AtomicSaver, SaveTarget};
 use crate::editor::{AdapterMode, Document, EditorInput, EditorSession, TextEdit};
+use crate::onboarding::ProviderPanel;
 use crate::references::activation::detect_activation;
 use crate::references::file::FileProvider;
 use crate::references::github::GithubProvider;
@@ -84,6 +85,7 @@ struct App {
     help_lines: Vec<String>,
     help_pending: bool,
     help_visible: bool,
+    providers: ProviderPanel,
     shell_sender: Sender<ShellResult>,
     shell_receiver: Receiver<ShellResult>,
     pending_shell: Option<PendingShell>,
@@ -160,6 +162,7 @@ impl App {
             Style::default().add_modifier(Modifier::UNDERLINED)
         })?;
         let (shell_sender, shell_receiver) = mpsc::channel();
+        let providers = ProviderPanel::new(repo.clone(), config.clone());
         Ok(Self {
             repo,
             document,
@@ -191,6 +194,7 @@ impl App {
             help_lines: config_help_lines(config),
             help_pending: false,
             help_visible: false,
+            providers,
             shell_sender,
             shell_receiver,
             pending_shell: None,
@@ -255,9 +259,16 @@ impl App {
             &self.repo.search_root,
         )? {
             Some(activation) => {
-                self.reference_session
-                    .activate(activation, self.search_limit)?;
-                self.status = "searching…".into();
+                let kind = activation.kind;
+                if let Err(error) = self
+                    .reference_session
+                    .activate(activation, self.search_limit)
+                {
+                    self.providers.record_failure(kind, &error.to_string());
+                    self.status = "Provider unavailable · Space p for setup".into();
+                } else {
+                    self.status = "searching…".into();
+                }
             }
             None => self.reference_session.close(),
         }
@@ -285,6 +296,7 @@ impl App {
     }
 
     fn tick(&mut self, now: Instant) {
+        self.providers.poll();
         self.drain_shell_results();
         if self.status != self.observed_status {
             self.observed_status.clone_from(&self.status);
@@ -443,6 +455,7 @@ impl App {
             Ok(CommandEffect::Quit) => self.should_exit = true,
             Ok(CommandEffect::Lower(request)) => self.begin_lower(request),
             Ok(CommandEffect::ReadShell(command)) => self.begin_shell_read(command),
+            Ok(CommandEffect::Providers) => self.open_providers(),
             Err(error) => self.status = error.to_string(),
         }
     }
@@ -489,8 +502,25 @@ impl App {
         for event in self.reference_session.drain_events() {
             match event {
                 ReferenceEvent::Query(update) => {
+                    let kind = self.reference_session.active_kind();
+                    if update.completed
+                        && update.error.is_none()
+                        && let Some(kind) = kind
+                    {
+                        self.providers.record_query_success(kind);
+                    }
                     if let Some(error) = update.error {
-                        self.status = error;
+                        if let Some(kind) = kind {
+                            self.providers.record_failure(kind, &error);
+                        }
+                        self.status = self
+                            .providers
+                            .reports
+                            .iter()
+                            .find(|report| Some(report.kind) == kind)
+                            .map_or(error, |report| {
+                                format!("{}: {} · :providers", report.name, report.state.label())
+                            });
                     } else if update.candidates_changed {
                         self.status =
                             format!("{} matches", self.reference_session.candidates().len());
@@ -553,6 +583,32 @@ impl App {
                     {
                         let _ = self.editor.set_cursor_char_offset(reference.range.start);
                     }
+                    let provider = reference_id
+                        .and_then(|id| {
+                            self.document
+                                .references()
+                                .iter()
+                                .find(|reference| reference.id == id)
+                                .and_then(|reference| match &reference.target {
+                                    ReferenceTarget::ExternalUrl(target) => Some(target.kind),
+                                    _ => None,
+                                })
+                        })
+                        .or_else(|| {
+                            matches!(kind, OperationKind::Accept | OperationKind::Preview)
+                                .then(|| self.reference_session.active_kind())
+                                .flatten()
+                        });
+                    if let Some(provider) = provider.filter(|provider| {
+                        matches!(
+                            provider,
+                            ReferenceKind::GitHubIssue
+                                | ReferenceKind::GitHubPullRequest
+                                | ReferenceKind::JiraIssue
+                        )
+                    }) {
+                        self.providers.record_failure(provider, &message);
+                    }
                     self.status = format!("Cannot {}: {message}", operation_name(kind));
                 }
                 ReferenceEvent::ContextTotalChanged { revision, total }
@@ -567,6 +623,14 @@ impl App {
         }
     }
 
+    fn open_providers(&mut self) {
+        self.reference_session.close();
+        self.preview = None;
+        self.help_visible = false;
+        self.help_pending = false;
+        self.providers.open();
+    }
+
     fn handle_help_key(&mut self, key: event::KeyEvent) -> bool {
         if self.help_visible {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?')) {
@@ -574,12 +638,16 @@ impl App {
             }
             return true;
         }
-        if self.editor.mode() != AdapterMode::Normal {
+        if self.editor.mode() != AdapterMode::Normal || self.editor.command_line().is_some() {
             self.help_pending = false;
             return false;
         }
         if self.help_pending {
             self.help_pending = false;
+            if key.code == KeyCode::Char('p') && key.modifiers.is_empty() {
+                self.open_providers();
+                return true;
+            }
             if key.code == KeyCode::Char('?')
                 && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
             {
@@ -597,6 +665,14 @@ impl App {
     }
 
     fn handle_event(&mut self, event: Event) {
+        if self.providers.visible {
+            if let Event::Key(key) = event
+                && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            {
+                self.providers.handle_key(key);
+            }
+            return;
+        }
         if let Event::Key(key) = event
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && self.handle_help_key(key)
@@ -867,10 +943,21 @@ fn status_text(app: &App, width: u16) -> String {
             format_context_total(app.refs_total, app.token_config.decimals)
         )
     });
+    let issues = app.providers.problem_count();
+    let provider_hint = if issues == 0 {
+        String::new()
+    } else {
+        format!("{issues} provider issue(s) · Space p")
+    };
+    let message = if app.status.is_empty() {
+        provider_hint.as_str()
+    } else {
+        app.status.as_str()
+    };
     let full = [
         mode.as_str(),
         &format!("{path}{dirty}"),
-        app.status.as_str(),
+        message,
         refs.as_deref().unwrap_or(""),
         &location,
     ]
@@ -880,6 +967,16 @@ fn status_text(app: &App, width: u16) -> String {
     .join("  ");
     if full.chars().count() <= usize::from(width) {
         return format!(" {full}");
+    }
+    if !message.is_empty() {
+        let available = usize::from(width).saturating_sub(mode.len() + location.len() + 5);
+        let message = if issues > 0 && message.chars().count() > available {
+            format!("{issues} issue(s) · Space p")
+        } else {
+            message.to_owned()
+        };
+        let message: String = message.chars().take(available).collect();
+        return format!(" {mode}  {message} {location}");
     }
     let compact = [mode.as_str(), refs.as_deref().unwrap_or(""), &location]
         .into_iter()
@@ -895,7 +992,7 @@ fn status_text(app: &App, width: u16) -> String {
 
 fn config_help_lines(config: &Config) -> Vec<String> {
     vec![
-        "Keys: Space ? help · Esc/q/? close".into(),
+        "Keys: Space ? help · Space p / :providers setup · Esc/q/? close".into(),
         "Completion: Tab/Enter accept · Up/Down or Ctrl-J/Ctrl-K select".into(),
         format!("Preview: {}", config.ui.preview_toggle),
         format!(
@@ -1057,6 +1154,10 @@ fn overlay_area(area: Rect, width_percent: u8, height: u16) -> Rect {
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    if app.providers.visible {
+        app.providers.draw(frame, frame.area(), app.color);
+        return;
+    }
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -1192,7 +1293,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
 pub struct Startup {
     pub repository: Repository,
-    pub config: Config,
+    pub config: LoadedConfig,
     pub document: Document,
     pub save_target: Option<SaveTarget>,
 }
@@ -1200,11 +1301,15 @@ pub struct Startup {
 pub fn run(startup: Startup) -> Result<()> {
     let mut app = App::new(
         startup.repository,
-        &startup.config,
+        &startup.config.config,
         startup.document,
         startup.save_target,
     )
     .context("could not initialize editor")?;
+    app.providers.set_loaded_config(&startup.config);
+    if app.save_target.is_none() {
+        app.status = "i to write · Space p for reference setup · Space ? for help".into();
+    }
     let mut guard = crate::terminal::TerminalGuard::stderr()?;
     {
         let mut terminal = Terminal::new(CrosstermBackend::new(guard.backend_mut().writer_mut()))?;
@@ -1513,6 +1618,79 @@ mod tests {
     }
 
     #[test]
+    fn provider_view_preserves_editing_and_command_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.github.enabled = false;
+        config.providers.jira.enabled = false;
+        let mut app = app_for(temp.path(), &config, "keep this prompt");
+        app.editor.set_cursor_char_offset(5).unwrap();
+        let before = (
+            app.document.text().to_owned(),
+            app.document.revision(),
+            app.editor.cursor_char_offset(),
+        );
+        app.dispatch_command(":providers".into());
+        assert!(app.providers.visible);
+        app.handle_event(Event::Paste("must not enter the prompt".into()));
+        for code in [
+            KeyCode::End,
+            KeyCode::Enter,
+            KeyCode::PageDown,
+            KeyCode::Esc,
+            KeyCode::Esc,
+        ] {
+            app.handle_event(Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+        assert!(!app.providers.visible);
+        assert_eq!(
+            (
+                app.document.text().to_owned(),
+                app.document.revision(),
+                app.editor.cursor_char_offset()
+            ),
+            before
+        );
+        for code in [KeyCode::Char(' '), KeyCode::Char('p')] {
+            app.handle_event(Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+        assert!(app.providers.visible);
+        app.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        for character in ":r !printf".chars() {
+            app.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert!(!app.providers.visible);
+        assert_eq!(app.editor.command_line(), Some("r !printf"));
+    }
+
+    #[test]
+    fn provider_recovery_hint_survives_long_filenames_and_status_expiry() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app_for(temp.path(), &Config::default(), "prompt");
+        app.save_target = Some(
+            SaveTarget::open(&temp.path().join("a-long-prompt-filename-".repeat(8)))
+                .unwrap()
+                .target,
+        );
+        app.providers
+            .record_failure(ReferenceKind::JiraIssue, "HTTP 401 unauthorized");
+        app.status = "Jira authentication failed".into();
+        let start = Instant::now();
+        app.tick(start);
+        app.tick(start + app.status_timeout + Duration::from_millis(1));
+        assert!(app.status.is_empty());
+        let status = status_text(&app, 40);
+        assert!(status.contains("Space p"), "{status}");
+        assert!(app.providers.problem_count() > 0);
+    }
+
+    #[test]
     fn replace_mode_edits_form_one_history_group() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = app_for(temp.path(), &Config::default(), "abc");
@@ -1748,7 +1926,14 @@ printf '%s' '{"key":"OPS-42","self":"https://jira.example/rest/api/3/issue/OPS-4
         let mut app = app_for(temp.path(), &config, "~i1");
 
         activate_text(&mut app, "~i1");
-        wait_for(&mut app, |app| app.status.contains("was not found"));
+        wait_for(&mut app, |app| {
+            app.providers.reports.iter().any(|report| {
+                report.kind == ReferenceKind::GitHubIssue
+                    && report.state
+                        == crate::references::diagnostics::HealthState::MissingExecutable
+            })
+        });
+        assert!(app.status.contains(":providers"));
 
         app.reference_session
             .start_query(

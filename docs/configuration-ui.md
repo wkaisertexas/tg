@@ -165,6 +165,33 @@ Useful CLI options are:
 Existing `tg update` remains a subcommand. Headless `--resolve` may remain for
 tests and scripts, updated to use the new provider/lowering engine.
 
+`tg setup` opens an optional onboarding view without opening or modifying a
+prompt. It lists every effective reference leader, local readiness, external
+connection status, examples, and setup instructions. Without a terminal it
+prints the local diagnostic report instead. It never starts automatically when
+another application invokes `tg` as an editor.
+
+`tg doctor` prints the same inventory without network requests. `--json` emits
+a structured report. `tg doctor --check jira`, `--check github`, and `--check all`
+explicitly request bounded, read-only connection checks using the providers'
+existing CLI authentication. A failed requested check exits with status 1;
+configuration or invocation errors exit with status 2. Missing optional services
+in a local-only inventory do not make installation fail.
+
+In Normal mode, `Space p` or `:providers` opens the same provider view while
+preserving the buffer, cursor, and undo history. Enter opens details; `r` tests
+the selected connection after confirmation; `R` tests all enabled remote
+connections after confirmation. `c` shows configuration sources, `?` opens the
+quick-start guide, and Esc or `q` goes back. Lists and details scroll with
+arrows, `j`/`k`, PageUp/PageDown, and Home/End. Ctrl-C cancels a running check;
+closing the provider view also cancels it.
+
+The view distinguishes configuration from verification. Remote credentials are
+not considered valid merely because a CLI exists or a search returns no matches.
+Results are scoped to this process and show their age. After changing tg settings
+or environment credentials, restart tg; changes to the external CLI's own
+configuration and credential store can be retested without rewriting the prompt.
+
 ## 7. Persistent Editor UI
 
 The normal screen dedicates all but one row to the buffer. There is no product
@@ -251,7 +278,11 @@ improve themes but is not required.
 
 Transient nonfatal messages replace the middle of the status line and expire
 after `status_timeout_ms`. Errors that block saving remain until acknowledged
-or corrected.
+or corrected. Provider failures also remain available in `:providers` after the
+status message expires or the view closes. The status line keeps a compact
+provider-problem count and `Space p` recovery hint; errors take precedence over a
+long filename. A successful subsequent query clears the previous query failure
+without claiming that authentication has been verified.
 
 Provider stderr is summarized, not streamed into the buffer. Detailed logs are
 opt-in and written outside stdout. Secrets and full inherited environments are

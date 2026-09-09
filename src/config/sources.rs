@@ -69,6 +69,8 @@ pub struct LoadedSource {
 pub struct LoadedConfig {
     pub config: Config,
     pub sources: Vec<LoadedSource>,
+    pub provenance: BTreeMap<String, LoadedSource>,
+    pub user_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -117,7 +119,7 @@ pub fn load(inputs: &ConfigInputs) -> Result<LoadedConfig, ConfigLoadError> {
     let mut provenance = BTreeMap::new();
 
     let (user_path, explicit_user_path) = user_config_path(inputs)?;
-    if let Some(path) = user_path {
+    if let Some(path) = user_path.clone() {
         if path.is_file() {
             let value = apply_file(&mut config, &path, SourceKind::User)?;
             record_provenance(&value, "", SourceKind::User, Some(&path), &mut provenance);
@@ -209,7 +211,12 @@ pub fn load(inputs: &ConfigInputs) -> Result<LoadedConfig, ConfigLoadError> {
         )
         .key(key)
     })?;
-    Ok(LoadedConfig { config, sources })
+    Ok(LoadedConfig {
+        config,
+        sources,
+        provenance,
+        user_path,
+    })
 }
 
 fn user_config_path(inputs: &ConfigInputs) -> Result<(Option<PathBuf>, bool), ConfigLoadError> {

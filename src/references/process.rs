@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -158,9 +159,9 @@ pub(crate) fn run(
         }
     };
 
-    let stdout = join_reader(stdout_reader)?;
-    let stderr = join_reader(stderr_reader)?;
     let status = outcome?;
+    let stdout = receive_output(stdout_reader, cancellation, started, request.timeout)?;
+    let stderr = receive_output(stderr_reader, cancellation, started, request.timeout)?;
     if exceeded.load(Ordering::Acquire) {
         return Err(ProcessError::OutputLimitExceeded(request.output_limit));
     }
@@ -178,32 +179,55 @@ fn spawn_reader(
     limit: usize,
     exceeded: Arc<AtomicBool>,
     bytes_seen: Arc<AtomicUsize>,
-) -> std::thread::JoinHandle<io::Result<Vec<u8>>> {
+) -> Receiver<io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut kept = Vec::with_capacity(limit.min(8 * 1024));
-        let mut buffer = [0_u8; 8 * 1024];
-        loop {
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                return Ok(kept);
+        let result = (|| {
+            let mut kept = Vec::with_capacity(limit.min(8 * 1024));
+            let mut buffer = [0_u8; 8 * 1024];
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    return Ok(kept);
+                }
+                let previous = bytes_seen.fetch_add(count, Ordering::AcqRel);
+                let keep = count.min(limit.saturating_sub(previous));
+                kept.extend_from_slice(&buffer[..keep]);
+                if previous.saturating_add(count) > limit {
+                    exceeded.store(true, Ordering::Release);
+                    return Ok(kept);
+                }
             }
-            let previous = bytes_seen.fetch_add(count, Ordering::AcqRel);
-            let keep = count.min(limit.saturating_sub(previous));
-            kept.extend_from_slice(&buffer[..keep]);
-            if previous.saturating_add(count) > limit {
-                exceeded.store(true, Ordering::Release);
-            }
-        }
-    })
+        })();
+        let _ = sender.send(result);
+    });
+    receiver
 }
 
-fn join_reader(
-    reader: std::thread::JoinHandle<io::Result<Vec<u8>>>,
+fn receive_output(
+    receiver: Receiver<io::Result<Vec<u8>>>,
+    cancellation: &CancellationFlag,
+    started: Instant,
+    timeout: Duration,
 ) -> Result<Vec<u8>, ProcessError> {
-    reader
-        .join()
-        .map_err(|_| ProcessError::Read(io::Error::other("output reader panicked")))?
-        .map_err(ProcessError::Read)
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(ProcessError::Cancelled);
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(ProcessError::TimedOut(timeout));
+        }
+        match receiver.recv_timeout(remaining.min(POLL_INTERVAL)) {
+            Ok(result) => return result.map_err(ProcessError::Read),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(ProcessError::Read(io::Error::other(
+                    "output reader stopped",
+                )));
+            }
+        }
+    }
 }
 
 fn terminate(child: &mut std::process::Child) {
@@ -250,6 +274,37 @@ fn redact_stderr(stderr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::redact_stderr;
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_output_pipes_cannot_extend_the_deadline() {
+        use super::{ProcessError, ProcessRequest, run};
+        use crate::references::CancellationFlag;
+        use std::time::{Duration, Instant};
+
+        for script in ["/bin/sleep 1 & wait", "/bin/sleep 1 & exit 0"] {
+            let started = Instant::now();
+            let result = run(
+                ProcessRequest {
+                    executable: "/bin/sh".into(),
+                    args: vec!["-c".into(), script.into()],
+                    cwd: std::env::current_dir().unwrap(),
+                    timeout: Duration::from_millis(50),
+                    output_limit: 1024,
+                    env: Vec::new(),
+                },
+                &CancellationFlag::default(),
+            );
+            assert!(
+                matches!(result, Err(ProcessError::TimedOut(_))),
+                "{result:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "a descendant kept the output pipe open"
+            );
+        }
+    }
 
     #[test]
     fn redacts_token_shaped_and_authorization_values() {
