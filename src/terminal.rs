@@ -85,7 +85,8 @@ impl TerminalBackend for StderrTerminal {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("could not {operation}: {source}")]
 pub struct TerminalError {
     pub operation: TerminalOperation,
     source: io::Error,
@@ -94,18 +95,6 @@ pub struct TerminalError {
 impl TerminalError {
     fn new(operation: TerminalOperation, source: io::Error) -> Self {
         Self { operation, source }
-    }
-}
-
-impl fmt::Display for TerminalError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "could not {}: {}", self.operation, self.source)
-    }
-}
-
-impl std::error::Error for TerminalError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
     }
 }
 

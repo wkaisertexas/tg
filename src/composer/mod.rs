@@ -1,22 +1,18 @@
 use crate::config::Config;
 use crate::language;
 use crate::references::activation::lower_snapshot;
-use crate::references::file::FileProvider;
-use crate::references::github::GithubProvider;
-use crate::references::jira::JiraProvider;
 use crate::references::model::{
     CompletionActivation, FileOrigin, GenerationId, LoweredReference, QueryRequest, QueryScope,
     ReferenceCandidate, ReferenceId, ReferenceKind, ReferenceTarget, ResolvedReference, TextRange,
 };
-use crate::references::skill::SkillProvider;
-use crate::references::symbol::SymbolProvider;
+use crate::references::model::{SharedProvider, char_to_byte};
 use crate::references::{CancellationFlag, ReferenceProvider};
 use crate::repository::Repository;
 use anyhow::{Context, Result, bail};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
-type Providers = HashMap<ReferenceKind, Box<dyn ReferenceProvider>>;
+type Providers = HashMap<ReferenceKind, SharedProvider>;
 
 /// Compatibility wrapper using the compiled configuration defaults.
 pub fn resolve_prompt(search_root: &Path, prompt: &str) -> Result<String> {
@@ -89,7 +85,7 @@ pub fn resolve_prompt_with_config(
     }
 
     let snapshot = lower_snapshot(prompt, &references, &config.leaders, |reference| {
-        let kind = target_kind(&reference.target);
+        let kind = reference.target.kind();
         let provider = providers
             .get(&kind)
             .with_context(|| format!("{} provider is unavailable", kind_name(kind)))?;
@@ -108,83 +104,15 @@ fn providers_for(
     config: &Config,
     activations: &[CompletionActivation],
 ) -> Result<Providers> {
-    let kinds: HashSet<_> = activations
-        .iter()
-        .map(|activation| activation.kind)
-        .collect();
-    let mut providers: Providers = HashMap::new();
-    if kinds.contains(&ReferenceKind::GitFile) {
-        providers.insert(
-            ReferenceKind::GitFile,
-            Box::new(FileProvider::new(
-                &repository.search_root,
-                ReferenceKind::GitFile,
-                &config.leaders.files,
-            )?),
-        );
-    }
-    if kinds.contains(&ReferenceKind::BroadFile) {
-        providers.insert(
-            ReferenceKind::BroadFile,
-            Box::new(FileProvider::with_broad_excludes(
-                &repository.search_root,
-                ReferenceKind::BroadFile,
-                &config.leaders.broad_files,
-                &config.search.broad_excludes,
-            )?),
-        );
-    }
-    if kinds.contains(&ReferenceKind::Symbol) {
-        providers.insert(
-            ReferenceKind::Symbol,
-            Box::new(SymbolProvider::with_broad_excludes(
-                &repository.search_root,
-                &config.leaders.files,
-                &config.search.broad_excludes,
-            )?),
-        );
-    }
-    if kinds.contains(&ReferenceKind::Skill) {
-        providers.insert(
-            ReferenceKind::Skill,
-            Box::new(SkillProvider::new(
-                &repository.search_root,
-                &repository.invocation_root,
-                &config.skills,
-                &config.leaders.skills,
-            )?),
-        );
-    }
-    if kinds.contains(&ReferenceKind::GitHubIssue) && config.providers.github.enabled {
-        providers.insert(
-            ReferenceKind::GitHubIssue,
-            Box::new(GithubProvider::issues(
-                &repository.invocation_root,
-                &config.leaders.github_issues,
-                &config.providers.github,
-            )),
-        );
-    }
-    if kinds.contains(&ReferenceKind::GitHubPullRequest) && config.providers.github.enabled {
-        providers.insert(
-            ReferenceKind::GitHubPullRequest,
-            Box::new(GithubProvider::pull_requests(
-                &repository.invocation_root,
-                &config.leaders.github_pull_requests,
-                &config.providers.github,
-            )),
-        );
-    }
-    if kinds.contains(&ReferenceKind::JiraIssue) && config.providers.jira.enabled {
-        providers.insert(
-            ReferenceKind::JiraIssue,
-            Box::new(JiraProvider::new(
-                &config.providers.jira,
-                &config.leaders.jira_issues,
-            )?),
-        );
-    }
-    Ok(providers)
+    let kinds = ReferenceKind::ALL.into_iter().filter(|kind| {
+        activations
+            .iter()
+            .any(|activation| activation.kind == *kind)
+    });
+    Ok(crate::references::configured(repository, config, kinds)?
+        .into_iter()
+        .map(|provider| (provider.kind(), provider))
+        .collect())
 }
 
 fn select_exact(
@@ -513,26 +441,6 @@ fn char_slice(text: &str, start: usize, end: usize) -> Option<&str> {
     let start = char_to_byte(text, start)?;
     let end = char_to_byte(text, end)?;
     text.get(start..end)
-}
-
-fn char_to_byte(text: &str, character: usize) -> Option<usize> {
-    if character == text.chars().count() {
-        Some(text.len())
-    } else {
-        text.char_indices().nth(character).map(|(byte, _)| byte)
-    }
-}
-
-fn target_kind(target: &ReferenceTarget) -> ReferenceKind {
-    match target {
-        ReferenceTarget::File(file) => match file.origin {
-            crate::references::model::FileOrigin::GitAware => ReferenceKind::GitFile,
-            crate::references::model::FileOrigin::Broad => ReferenceKind::BroadFile,
-        },
-        ReferenceTarget::Symbol(_) => ReferenceKind::Symbol,
-        ReferenceTarget::Skill(_) => ReferenceKind::Skill,
-        ReferenceTarget::ExternalUrl(url) => url.kind,
-    }
 }
 
 fn kind_name(kind: ReferenceKind) -> &'static str {

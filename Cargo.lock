@@ -2949,6 +2949,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "tempfile",
+ "thiserror 2.0.19",
  "tiktoken-rs",
  "toml",
  "tree-sitter",

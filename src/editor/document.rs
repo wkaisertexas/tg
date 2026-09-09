@@ -1,4 +1,4 @@
-use crate::references::model::{AcceptedReference, ResolvedReference, TextRange};
+use crate::references::model::{AcceptedReference, ResolvedReference, TextRange, char_to_byte};
 use anyhow::{Context, Result, bail, ensure};
 use std::fs::Permissions;
 use std::path::{Path, PathBuf};
@@ -422,13 +422,6 @@ fn byte_range(text: &str, range: TextRange) -> Result<std::ops::Range<usize>> {
         bail!("range is reversed");
     }
     Ok(start..end)
-}
-
-fn char_to_byte(text: &str, index: usize) -> Option<usize> {
-    if index == text.chars().count() {
-        return Some(text.len());
-    }
-    text.char_indices().nth(index).map(|(byte, _)| byte)
 }
 
 #[cfg(test)]

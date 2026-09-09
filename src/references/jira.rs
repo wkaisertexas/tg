@@ -4,17 +4,15 @@ use super::model::{
     CandidateDisplay, CandidateId, ContextCost, ExternalUrlTarget, Preview, PreviewLine,
     QueryRequest, QueryScope, ReferenceCandidate, ReferenceKind, ReferenceTarget, ValidatedTarget,
 };
+use super::process::{ProcessError, ProcessRequest, run_per_stream};
 use super::{CancellationFlag, ReferenceProvider};
 use crate::config::JiraProviderConfig;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{self, Read};
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::path::PathBuf;
 use std::sync::Mutex;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const DEFAULT_OUTPUT_CAP: usize = 1024 * 1024;
 const PREVIEW_BODY_LIMIT: usize = 2_000;
@@ -96,22 +94,32 @@ impl JiraProvider {
                 search_jql(text),
             ],
         };
-        let output = match run_bounded(
-            &self.command,
-            &arguments,
-            self.timeout,
-            self.output_cap,
+        if cancellation.is_cancelled() {
+            return Ok(Vec::new());
+        }
+        let output = match run_per_stream(
+            ProcessRequest {
+                executable: self.command.clone(),
+                args: arguments.into_iter().map(Into::into).collect(),
+                cwd: std::env::current_dir()?,
+                timeout: self.timeout,
+                output_limit: self.output_cap,
+                env: Vec::new(),
+            },
             cancellation,
         ) {
             Ok(output) => output,
             Err(_) if cancellation.is_cancelled() => return Ok(Vec::new()),
-            Err(error) => return Err(error),
+            Err(ProcessError::Failed { stderr, .. }) => {
+                bail!(normalize_cli_error(stderr.as_bytes()))
+            }
+            Err(ProcessError::MissingExecutable(_) | ProcessError::Spawn { .. }) => {
+                bail!("Jira unavailable: cannot run {}", self.command.display())
+            }
+            Err(error) => return Err(error.into()),
         };
         if cancellation.is_cancelled() {
             return Ok(Vec::new());
-        }
-        if !output.status.success() {
-            bail!(normalize_cli_error(&output.stderr));
         }
         let value: Value =
             serde_json::from_slice(&output.stdout).context("Jira returned malformed raw JSON")?;
@@ -464,87 +472,6 @@ fn issue_score(issue: &JiraIssue, query: &str) -> u8 {
     }
 }
 
-struct ProcessOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-fn run_bounded(
-    executable: &Path,
-    arguments: &[String],
-    timeout: Duration,
-    cap: usize,
-    cancellation: &CancellationFlag,
-) -> Result<ProcessOutput> {
-    if cancellation.is_cancelled() {
-        bail!("Jira request was cancelled")
-    }
-    let mut child = Command::new(executable)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("Jira unavailable: cannot run {}", executable.display()))?;
-    let stdout = child.stdout.take().context("cannot capture Jira output")?;
-    let stderr = child.stderr.take().context("cannot capture Jira errors")?;
-    let stdout_reader = thread::spawn(move || read_capped(stdout, cap));
-    let stderr_reader = thread::spawn(move || read_capped(stderr, cap));
-    let started = Instant::now();
-    let status = loop {
-        if cancellation.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            bail!("Jira request was cancelled")
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            bail!("Jira request timed out")
-        }
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let (stdout, stdout_exceeded) = stdout_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("Jira output reader failed"))??;
-    let (stderr, stderr_exceeded) = stderr_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("Jira error reader failed"))??;
-    ensure!(
-        !stdout_exceeded && !stderr_exceeded,
-        "Jira output exceeded the configured limit"
-    );
-    Ok(ProcessOutput {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn read_capped(mut reader: impl Read, cap: usize) -> io::Result<(Vec<u8>, bool)> {
-    let mut stored = Vec::with_capacity(cap.min(8192));
-    let mut buffer = [0_u8; 8192];
-    let mut exceeded = false;
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        let remaining = cap.saturating_sub(stored.len());
-        stored.extend_from_slice(&buffer[..count.min(remaining)]);
-        exceeded |= count > remaining;
-    }
-    Ok((stored, exceeded))
-}
-
 fn normalize_cli_error(stderr: &[u8]) -> String {
     use super::diagnostics::{HealthState, classify_failure};
 
@@ -568,6 +495,7 @@ mod tests {
     use crate::references::model::GenerationId;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::thread;
 
     fn request(query: &str) -> QueryRequest {
         QueryRequest {

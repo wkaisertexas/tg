@@ -1,4 +1,5 @@
 use crate::references::BackgroundExecutor;
+use crate::references::model::char_to_byte;
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -397,14 +398,6 @@ fn character_range_to_bytes(source: &str, range: Range<usize>) -> Result<Range<u
     let start = char_to_byte(source, range.start).context("invalid character range start")?;
     let end = char_to_byte(source, range.end).context("invalid character range end")?;
     Ok(start..end)
-}
-
-fn char_to_byte(source: &str, offset: usize) -> Option<usize> {
-    if offset == source.chars().count() {
-        Some(source.len())
-    } else {
-        source.char_indices().nth(offset).map(|(byte, _)| byte)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

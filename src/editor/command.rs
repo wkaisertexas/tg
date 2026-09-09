@@ -1,7 +1,5 @@
 use super::{Document, DocumentPath, DocumentSnapshot};
 pub use crate::references::session::LowerPurpose;
-use std::error::Error;
-use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExCommand {
@@ -48,36 +46,23 @@ pub enum CommandEffect {
     Providers,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommandError {
+    #[error("copy command must be colon-prefixed and must not replace a built-in command")]
     InvalidCopyCommand,
+    #[error("empty command")]
     Empty,
+    #[error("unknown command: {0}")]
     Unknown(String),
+    #[error("command does not accept arguments: {0}")]
     ArgumentsNotSupported(String),
+    #[error("read command requires text after `!`")]
     EmptyShellCommand,
+    #[error("No write since last change")]
     NoWriteSinceLastChange,
+    #[error("No file name")]
     NoFileName,
 }
-
-impl fmt::Display for CommandError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidCopyCommand => formatter.write_str(
-                "copy command must be colon-prefixed and must not replace a built-in command",
-            ),
-            Self::Empty => formatter.write_str("empty command"),
-            Self::Unknown(command) => write!(formatter, "unknown command: {command}"),
-            Self::ArgumentsNotSupported(command) => {
-                write!(formatter, "command does not accept arguments: {command}")
-            }
-            Self::EmptyShellCommand => formatter.write_str("read command requires text after `!`"),
-            Self::NoWriteSinceLastChange => formatter.write_str("No write since last change"),
-            Self::NoFileName => formatter.write_str("No file name"),
-        }
-    }
-}
-
-impl Error for CommandError {}
 
 #[derive(Debug, Clone)]
 pub struct CommandDispatcher {

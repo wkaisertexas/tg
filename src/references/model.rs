@@ -21,6 +21,26 @@ pub enum ReferenceKind {
     JiraIssue,
 }
 
+impl ReferenceKind {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::GitFile,
+        Self::BroadFile,
+        Self::Symbol,
+        Self::Skill,
+        Self::GitHubIssue,
+        Self::GitHubPullRequest,
+        Self::JiraIssue,
+    ];
+}
+
+pub(crate) fn char_to_byte(text: &str, index: usize) -> Option<usize> {
+    if index == text.chars().count() {
+        Some(text.len())
+    } else {
+        text.char_indices().nth(index).map(|(byte, _)| byte)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CandidateId {
     pub provider: ReferenceKind,
@@ -170,6 +190,20 @@ pub enum ReferenceTarget {
     Symbol(SymbolTarget),
     Skill(SkillTarget),
     ExternalUrl(ExternalUrlTarget),
+}
+
+impl ReferenceTarget {
+    pub(crate) fn kind(&self) -> ReferenceKind {
+        match self {
+            Self::File(file) => match file.origin {
+                FileOrigin::GitAware => ReferenceKind::GitFile,
+                FileOrigin::Broad => ReferenceKind::BroadFile,
+            },
+            Self::Symbol(_) => ReferenceKind::Symbol,
+            Self::Skill(_) => ReferenceKind::Skill,
+            Self::ExternalUrl(url) => url.kind,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

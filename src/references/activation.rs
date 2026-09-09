@@ -1,3 +1,4 @@
+use super::model::char_to_byte;
 use super::model::{
     CompletionActivation, FileOrigin, LoweredReference, ReferenceKind, ResolvedReference, TextRange,
 };
@@ -257,13 +258,6 @@ fn is_token_boundary(text: &str, byte: usize) -> bool {
 
 fn is_token_terminator(character: char) -> bool {
     character.is_whitespace() || matches!(character, ')' | ']' | '}' | '>' | '"' | '\'')
-}
-
-fn char_to_byte(text: &str, character: usize) -> Option<usize> {
-    if character == text.chars().count() {
-        return Some(text.len());
-    }
-    text.char_indices().nth(character).map(|(byte, _)| byte)
 }
 
 fn byte_to_char(text: &str, byte: usize) -> usize {

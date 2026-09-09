@@ -1,6 +1,5 @@
 use super::CancellationFlag;
 use std::ffi::OsString;
-use std::fmt;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
@@ -27,77 +26,47 @@ pub(crate) struct ProcessOutput {
     pub stdout: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum ProcessError {
+    #[error("provider executable `{}` was not found; install it or configure its path", .0.display())]
     MissingExecutable(PathBuf),
+    #[error("could not run `{}`: {source}", .executable.display())]
     Spawn {
         executable: PathBuf,
         source: io::Error,
     },
-    Wait(io::Error),
-    Read(io::Error),
+    #[error("could not wait for provider command: {0}")]
+    Wait(#[source] io::Error),
+    #[error("could not read provider output: {0}")]
+    Read(#[source] io::Error),
+    #[error("provider command timed out after {} ms", .0.as_millis())]
     TimedOut(Duration),
+    #[error("provider command was cancelled")]
     Cancelled,
+    #[error("provider output exceeded the {0}-byte safety limit")]
     OutputLimitExceeded(usize),
-    Failed {
-        status: ExitStatus,
-        stderr: String,
-    },
-}
-
-impl fmt::Display for ProcessError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingExecutable(path) => write!(
-                formatter,
-                "provider executable `{}` was not found; install it or configure its path",
-                path.display()
-            ),
-            Self::Spawn { executable, source } => {
-                write!(
-                    formatter,
-                    "could not run `{}`: {source}",
-                    executable.display()
-                )
-            }
-            Self::Wait(source) => {
-                write!(formatter, "could not wait for provider command: {source}")
-            }
-            Self::Read(source) => write!(formatter, "could not read provider output: {source}"),
-            Self::TimedOut(timeout) => {
-                write!(
-                    formatter,
-                    "provider command timed out after {} ms",
-                    timeout.as_millis()
-                )
-            }
-            Self::Cancelled => formatter.write_str("provider command was cancelled"),
-            Self::OutputLimitExceeded(limit) => write!(
-                formatter,
-                "provider output exceeded the {limit}-byte safety limit"
-            ),
-            Self::Failed { status, stderr } if stderr.is_empty() => {
-                write!(formatter, "provider command exited with {status}")
-            }
-            Self::Failed { status, stderr } => {
-                write!(formatter, "provider command exited with {status}: {stderr}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProcessError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Spawn { source, .. } | Self::Wait(source) | Self::Read(source) => Some(source),
-            _ => None,
-        }
-    }
+    #[error("provider command exited with {status}{separator}{stderr}", separator = if .stderr.is_empty() { "" } else { ": " })]
+    Failed { status: ExitStatus, stderr: String },
 }
 
 pub(crate) fn run(
     request: ProcessRequest,
     cancellation: &CancellationFlag,
+) -> Result<ProcessOutput, ProcessError> {
+    run_bounded(request, cancellation, true)
+}
+
+pub(crate) fn run_per_stream(
+    request: ProcessRequest,
+    cancellation: &CancellationFlag,
+) -> Result<ProcessOutput, ProcessError> {
+    run_bounded(request, cancellation, false)
+}
+
+fn run_bounded(
+    request: ProcessRequest,
+    cancellation: &CancellationFlag,
+    combined_limit: bool,
 ) -> Result<ProcessOutput, ProcessError> {
     let mut command = Command::new(&request.executable);
     command
@@ -132,7 +101,11 @@ pub(crate) fn run(
         child.stderr.take().expect("piped stderr is available"),
         request.output_limit,
         Arc::clone(&exceeded),
-        Arc::clone(&bytes_seen),
+        if combined_limit {
+            bytes_seen
+        } else {
+            Arc::default()
+        },
     );
 
     let started = Instant::now();
@@ -304,6 +277,38 @@ mod tests {
                 "a descendant kept the output pipe open"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn separate_stream_limits_preserve_jira_budget_without_weakening_other_callers() {
+        use super::{ProcessError, ProcessRequest, run, run_per_stream};
+        use crate::references::CancellationFlag;
+        use std::time::Duration;
+
+        let request = || ProcessRequest {
+            executable: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf 12345678; printf 12345678 >&2".into()],
+            cwd: std::env::current_dir().unwrap(),
+            timeout: Duration::from_secs(2),
+            output_limit: 8,
+            env: Vec::new(),
+        };
+        let cancellation = CancellationFlag::default();
+        assert!(matches!(
+            run(request(), &cancellation),
+            Err(ProcessError::OutputLimitExceeded(8))
+        ));
+        assert_eq!(
+            run_per_stream(request(), &cancellation).unwrap().stdout,
+            b"12345678"
+        );
+        let mut oversized = request();
+        oversized.output_limit = 7;
+        assert!(matches!(
+            run_per_stream(oversized, &cancellation),
+            Err(ProcessError::OutputLimitExceeded(7))
+        ));
     }
 
     #[test]

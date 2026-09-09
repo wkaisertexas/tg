@@ -40,6 +40,7 @@ tree-sitter-python = "0.23"
 tree-sitter-rust = "0.24"
 tree-sitter-ruby = "0.23.1"
 tree-sitter-typescript = "0.23.2"
+thiserror = "=2.0.19"
 
 [dev-dependencies]
 assert_cmd = "2"

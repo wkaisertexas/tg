@@ -4,7 +4,6 @@
 //! does not know about friendly text or reference lowering.
 
 use sha2::{Digest, Sha256};
-use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
@@ -411,16 +410,13 @@ impl Drop for TempCleanup {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SaveError {
-    InvalidTarget {
-        path: PathBuf,
-        message: String,
-    },
-    Conflict {
-        path: PathBuf,
-        message: String,
-    },
+    #[error("{}: {message}", .path.display())]
+    InvalidTarget { path: PathBuf, message: String },
+    #[error("{}: write conflict: {message}", .path.display())]
+    Conflict { path: PathBuf, message: String },
+    #[error("{operation} {}: {source}", .path.display())]
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -453,33 +449,6 @@ impl SaveError {
 
     pub fn is_conflict(&self) -> bool {
         matches!(self, Self::Conflict { .. })
-    }
-}
-
-impl fmt::Display for SaveError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidTarget { path, message } => {
-                write!(formatter, "{}: {message}", path.display())
-            }
-            Self::Conflict { path, message } => {
-                write!(formatter, "{}: write conflict: {message}", path.display())
-            }
-            Self::Io {
-                operation,
-                path,
-                source,
-            } => write!(formatter, "{operation} {}: {source}", path.display()),
-        }
-    }
-}
-
-impl std::error::Error for SaveError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            _ => None,
-        }
     }
 }
 

@@ -1,4 +1,6 @@
 pub mod activation;
+mod configured;
+pub(crate) use configured::configured;
 pub mod diagnostics;
 pub mod file;
 pub mod github;
