@@ -11,6 +11,7 @@ pub enum ExCommand {
     WriteAndQuit,
     Copy,
     ReadShell(String),
+    Providers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub enum CommandEffect {
     Quit,
     Lower(LowerRequest),
     ReadShell(String),
+    Providers,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +90,10 @@ impl CommandDispatcher {
         if !copy_command.starts_with(':')
             || copy_command.len() == 1
             || copy_command.trim() != copy_command
-            || matches!(copy_command.as_str(), ":w" | ":q" | ":q!" | ":wq")
+            || matches!(
+                copy_command.as_str(),
+                ":w" | ":q" | ":q!" | ":wq" | ":providers"
+            )
             || copy_command.starts_with(":r !")
             || copy_command.starts_with(":read !")
         {
@@ -122,8 +127,9 @@ impl CommandDispatcher {
             ":q" => Ok(ExCommand::Quit),
             ":q!" => Ok(ExCommand::ForceQuit),
             ":wq" => Ok(ExCommand::WriteAndQuit),
+            ":providers" => Ok(ExCommand::Providers),
             _ if has_arguments(command, &self.copy_command)
-                || [":w", ":q", ":q!", ":wq"]
+                || [":w", ":q", ":q!", ":wq", ":providers"]
                     .iter()
                     .any(|known| has_arguments(command, known)) =>
             {
@@ -144,6 +150,7 @@ impl CommandDispatcher {
                 snapshot: document.snapshot(),
             })),
             ExCommand::ReadShell(command) => Ok(CommandEffect::ReadShell(command)),
+            ExCommand::Providers => Ok(CommandEffect::Providers),
         }
     }
 
@@ -188,6 +195,7 @@ mod tests {
             (":q!", ExCommand::ForceQuit),
             ("\n:wq ", ExCommand::WriteAndQuit),
             (":copy", ExCommand::Copy),
+            (":providers", ExCommand::Providers),
         ] {
             assert_eq!(parser.parse(input).unwrap(), expected);
         }

@@ -19,6 +19,8 @@ const CONFIG_ENVIRONMENT: &[&str] = &[
 #[derive(Debug, Parser)]
 #[command(
     version,
+    args_conflicts_with_subcommands = true,
+    after_help = "New here? Run `tg setup` to discover reference leaders and configure optional connections.\nUse `tg doctor` for a local-only report, or `tg doctor --check jira` to test Jira.",
     about = "Compose coding-agent prompts with structured references",
     long_about = "Edit coding-agent prompts with structured references.\n\nFILE may be an existing UTF-8 file or a new file whose parent directory exists."
 )]
@@ -28,27 +30,27 @@ pub(crate) struct Cli {
     file: Option<PathBuf>,
 
     /// Directory inside the project to search.
-    #[arg(long, value_name = "DIRECTORY")]
+    #[arg(long, global = true, value_name = "DIRECTORY")]
     root: Option<PathBuf>,
 
     /// Replace the normal user configuration file.
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
 
     /// Do not load .tg.toml from the repository root.
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_project_config: bool,
 
     /// Select a built-in tokenizer by name.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, global = true, value_name = "NAME")]
     tokenizer: Option<String>,
 
     /// Disable the completion preview.
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_preview: bool,
 
     /// Disable colored output.
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_color: bool,
 
     /// Resolve one prompt without opening the TUI (useful for scripts/tests).
@@ -60,9 +62,18 @@ pub(crate) struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// Replace this executable with the latest verified GitHub release.
     Update,
+    #[command(about = "Discover reference leaders and set up optional connections")]
+    Setup,
+    #[command(about = "Show leaders and configuration; check connections only when requested")]
+    Doctor {
+        #[arg(long, num_args = 0..=1, default_missing_value = "all", value_parser = ["all", "github", "jira"], value_name = "PROVIDER", help = "Run read-only network checks using the selected CLI credentials")]
+        check: Option<String>,
+        #[arg(long, help = "Print a structured report without credential values")]
+        json: bool,
+    },
 }
 
 impl Cli {
@@ -72,6 +83,10 @@ impl Cli {
 
     pub(crate) fn requests_update(&self) -> bool {
         matches!(self.command, Some(Command::Update))
+    }
+
+    pub(crate) fn command(&self) -> Option<&Command> {
+        self.command.as_ref()
     }
 
     pub(crate) fn file(&self) -> Option<&Path> {

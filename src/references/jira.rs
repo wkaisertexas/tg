@@ -546,32 +546,20 @@ fn read_capped(mut reader: impl Read, cap: usize) -> io::Result<(Vec<u8>, bool)>
 }
 
 fn normalize_cli_error(stderr: &[u8]) -> String {
-    let text = String::from_utf8_lossy(stderr);
-    let lower = text.to_ascii_lowercase();
-    if [
-        "authorization",
-        "bearer",
-        "token",
-        "api_token",
-        "api token",
-        "password",
-        "unauthorized",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-    {
-        return "Jira authentication failed; run `jira init`".to_owned();
+    use super::diagnostics::{HealthState, classify_failure};
+
+    match classify_failure(&String::from_utf8_lossy(stderr)) {
+        HealthState::AuthFailed => "Jira authentication failed; run `jira init`, check the auth mode (on-premises PAT requires bearer), and restart tg after updating environment credentials",
+        HealthState::AccessDenied => "Jira access denied; confirm the project and Browse Projects permission with your administrator",
+        HealthState::ConnectionFailed => "Jira connection failed; check the server URL, VPN, DNS, proxy, and TLS trust or client certificates; do not disable TLS verification",
+        HealthState::TimedOut => "Jira request timed out; check connectivity and the configured timeout",
+        HealthState::NotConfigured => "Jira is not configured; run `jira init` using the intended JIRA_CONFIG_FILE to select the server and project",
+        HealthState::MissingExecutable => "Jira unavailable; install ankitpokhrel/jira-cli or correct providers.jira.command",
+        HealthState::Unsupported => "Jira CLI operation is unsupported; use an ankitpokhrel/jira-cli version supporting issue list/view --raw",
+        HealthState::NotChecked => "Jira request was cancelled",
+        _ => "Jira command failed or returned malformed output; verify the CLI version and query, then retry; raw output withheld for safety",
     }
-    let concise: String = text
-        .chars()
-        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-        .take(512)
-        .collect();
-    if concise.trim().is_empty() {
-        "Jira command failed".to_owned()
-    } else {
-        format!("Jira command failed: {}", concise.trim())
-    }
+    .to_owned()
 }
 
 #[cfg(test)]

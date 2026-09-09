@@ -263,8 +263,10 @@ host from the worktree and its standard configuration.
 
 The child inherits `GH_HOST`, `GH_REPO`, `GH_TOKEN`, `GITHUB_TOKEN`,
 `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, and normal `gh` credential
-storage. `TG` never reads or logs these values. It sets noninteractive and
-no-color behavior where supported and captures stdout/stderr separately.
+storage. `TG` never reads or logs credential values. Onboarding may inspect
+non-secret host/repository metadata to identify the target of an explicit check.
+It sets noninteractive and no-color behavior where supported and captures
+stdout/stderr separately.
 
 Candidates show number, title, state, and update age. Accepted issues and pull
 requests lower to the exact full `url` returned by `gh`.
@@ -301,11 +303,20 @@ be used to derive the base when the CLI's output does not expose it directly.
 
 Accepted issues always lower to a full URL, never only to the key.
 
+Onboarding reads allowlisted server/project/auth-mode metadata from the selected
+Jira CLI configuration so an authentication failure can still name its target.
+An explicit connection check performs a bounded issue search. A successful
+search is shown as `Search works`, not as verified authentication: the supported
+Jira CLI's `me` command only prints the locally configured login. Public or empty
+results do not prove that an API token is valid. Authentication rejection,
+permission denial, connectivity failure, and malformed output remain distinct
+from successful search access; raw service output and credentials are not shown.
+
 ## 10. Subprocess Policy
 
 Provider subprocesses:
 
-- run only after their leader activates;
+- run only after their leader activates or the user explicitly requests a connection check;
 - never use a shell;
 - receive query text as a distinct argument;
 - inherit the environment without enumerating it in logs;

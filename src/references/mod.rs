@@ -1,4 +1,5 @@
 pub mod activation;
+pub mod diagnostics;
 pub mod file;
 pub mod github;
 pub mod jira;
