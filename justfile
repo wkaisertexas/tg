@@ -18,6 +18,7 @@ test:
     cargo test --all-targets --all-features
 
 check:
+    python3 tests/test_bump_version.py
     cargo fmt --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --all-targets --all-features

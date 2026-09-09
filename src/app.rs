@@ -357,10 +357,10 @@ impl App {
                 Ok(result) => result,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             };
-            if !self
+            if self
                 .pending_shell
                 .as_ref()
-                .is_some_and(|pending| pending.id == result.id)
+                .is_none_or(|pending| pending.id != result.id)
             {
                 continue;
             }

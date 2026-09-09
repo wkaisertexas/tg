@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const DEFAULT_OUTPUT_LIMIT: usize = 1024 * 1024;
 
@@ -81,6 +82,8 @@ impl GithubProvider {
         [
             subject.to_owned(),
             "list".to_owned(),
+            "--state".to_owned(),
+            "all".to_owned(),
             "--search".to_owned(),
             query.to_owned(),
             "--limit".to_owned(),
@@ -157,9 +160,13 @@ impl ReferenceProvider for GithubProvider {
             validate_url(&item.url)?;
         }
 
-        if let Ok(exact_number) = request.query.trim().parse::<u64>() {
-            items.sort_by_key(|item| item.number != exact_number);
-        }
+        let exact_number = request.query.trim().parse::<u64>().ok();
+        items.sort_by_key(|item| {
+            (
+                exact_number.is_some_and(|number| item.number != number),
+                !item.state.eq_ignore_ascii_case("open"),
+            )
+        });
         items.truncate(limit);
         let mut cache = self.items_by_url.lock().expect("GitHub item cache lock");
         for item in &items {
@@ -318,13 +325,19 @@ fn validate_url(url: &str) -> Result<()> {
 }
 
 fn format_update_age(updated_at: &str) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64);
-    let Some(updated) = parse_github_timestamp(updated_at) else {
+    format_update_age_at(updated_at, OffsetDateTime::now_utc())
+}
+
+/// Parses the RFC 3339 timestamp emitted by `gh` using `time` for presentation
+/// metadata while preserving malformed values in the fallback text.
+fn format_update_age_at(updated_at: &str, now: OffsetDateTime) -> String {
+    let Ok(updated) = OffsetDateTime::parse(updated_at, &Rfc3339) else {
         return format!("updated {updated_at}");
     };
-    let elapsed = now.saturating_sub(updated).max(0) as u64;
+    let elapsed = now
+        .unix_timestamp()
+        .saturating_sub(updated.unix_timestamp())
+        .max(0) as u64;
     let age = match elapsed {
         0..=59 => "just now".to_owned(),
         60..=3_599 => format!("{}m ago", elapsed / 60),
@@ -332,50 +345,6 @@ fn format_update_age(updated_at: &str) -> String {
         _ => format!("{}d ago", elapsed / 86_400),
     };
     format!("updated {age}")
-}
-
-/// Parses the fixed-width RFC 3339 UTC form emitted by `gh` without adding a
-/// date-time dependency solely for presentation metadata.
-fn parse_github_timestamp(value: &str) -> Option<i64> {
-    let bytes = value.as_bytes();
-    if bytes.len() < 20
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes[10] != b'T'
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-        || !value.ends_with('Z')
-    {
-        return None;
-    }
-    let number = |range: std::ops::Range<usize>| {
-        std::str::from_utf8(&bytes[range]).ok()?.parse::<i64>().ok()
-    };
-    let year = number(0..4)?;
-    let month = number(5..7)?;
-    let day = number(8..10)?;
-    let hour = number(11..13)?;
-    let minute = number(14..16)?;
-    let second = number(17..19)?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || !(0..=23).contains(&hour)
-        || !(0..=59).contains(&minute)
-        || !(0..=60).contains(&second)
-    {
-        return None;
-    }
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let adjusted_year = year - i64::from(month <= 2);
-    let era = adjusted_year.div_euclid(400);
-    let year_of_era = adjusted_year - era * 400;
-    let shifted_month = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
 }
 
 #[cfg(all(test, unix))]
@@ -483,6 +452,8 @@ esac
             [
                 "issue",
                 "list",
+                "--state",
+                "all",
                 "--search",
                 "7",
                 "--limit",
@@ -538,6 +509,8 @@ esac
             [
                 "pr",
                 "list",
+                "--state",
+                "all",
                 "--search",
                 "ship",
                 "--limit",
@@ -556,6 +529,38 @@ esac
                 .unwrap()
                 .contains("draft")
         );
+    }
+
+    #[test]
+    fn open_items_rank_first_without_filtering_other_states() {
+        for (kind, leader, non_open_state, path) in [
+            (ReferenceKind::GitHubIssue, "#", "CLOSED", "issues"),
+            (ReferenceKind::GitHubPullRequest, "!", "MERGED", "pull"),
+        ] {
+            let fake = FakeGh::new();
+            fake.write_response(format!(
+                r#"[
+                  {{"number":1,"title":"Older","url":"https://github.example/team/repo/{path}/1","state":"{non_open_state}","updatedAt":"2026-08-17T12:00:00Z"}},
+                  {{"number":2,"title":"Active","url":"https://github.example/team/repo/{path}/2","state":"OPEN","updatedAt":"2026-08-16T12:00:00Z"}},
+                  {{"number":3,"title":"Also older","url":"https://github.example/team/repo/{path}/3","state":"{non_open_state}","updatedAt":"2026-08-15T12:00:00Z"}}
+                ]"#
+            ));
+            let candidates = fake
+                .provider(kind, 1_000)
+                .query(request("work", 10), &CancellationFlag::default())
+                .unwrap();
+            assert_eq!(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.friendly_text.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    format!("{leader}2"),
+                    format!("{leader}1"),
+                    format!("{leader}3")
+                ]
+            );
+        }
     }
 
     #[test]
@@ -660,8 +665,14 @@ esac
 
     #[test]
     fn github_timestamps_are_rendered_as_compact_ages() {
-        let updated = parse_github_timestamp("2026-08-17T10:00:00Z").unwrap();
-        assert_eq!(days_from_civil(2026, 8, 17) * 86_400 + 10 * 3_600, updated);
-        assert!(parse_github_timestamp("not-a-timestamp").is_none());
+        let now = OffsetDateTime::parse("2026-08-17T11:01:00Z", &Rfc3339).unwrap();
+        assert_eq!(
+            format_update_age_at("2026-08-17T12:00:00+02:00", now),
+            "updated 1h ago"
+        );
+        assert_eq!(
+            format_update_age_at("2026-02-31T10:00:00Z", now),
+            "updated 2026-02-31T10:00:00Z"
+        );
     }
 }
