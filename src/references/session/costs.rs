@@ -1,8 +1,7 @@
 use super::*;
 use crate::references::model::CandidateTokenSource;
 use crate::tokens::{
-    ContextFileVersion, ContextIdentity, ContextTotal, ReferenceContext, TokenGeneration,
-    TokenState, TokenSubject,
+    ContextIdentity, ContextTotal, ReferenceContext, TokenGeneration, TokenState, TokenSubject,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -254,11 +253,7 @@ fn reference_context(reference: &ResolvedReference) -> Option<ReferenceContext> 
                 canonical_path: symbol.file.canonical_path.clone(),
                 start_byte: symbol.start_byte,
                 end_byte: symbol.end_byte,
-                file_version: ContextFileVersion {
-                    size: version.size,
-                    modified: version.modified,
-                    content_sha256: version.content_sha256,
-                },
+                file_version: version.clone(),
             }
         }
         ReferenceTarget::Skill(_) | ReferenceTarget::ExternalUrl(_) => return None,

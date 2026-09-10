@@ -12,3 +12,6 @@ pub mod search;
 pub mod terminal;
 pub mod tokens;
 pub mod updater;
+
+#[cfg(test)]
+mod test_support;

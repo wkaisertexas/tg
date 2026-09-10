@@ -5,6 +5,7 @@ use crate::references::model::{
     CandidateDisplay, CandidateTokenSource, FileOrigin, FileTarget, PreviewLine, QueryEmission,
     QueryRequest, QueryScope, ValidatedTarget,
 };
+use crate::test_support::ManualExecutor;
 use anyhow::bail;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,29 +17,6 @@ mod operations;
 mod query;
 
 type RecordedCalls = Arc<Mutex<Vec<(&'static str, ThreadId)>>>;
-
-#[derive(Default)]
-struct ManualExecutor {
-    jobs: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
-}
-impl BackgroundExecutor for ManualExecutor {
-    fn spawn(&self, job: Box<dyn FnOnce() + Send>) {
-        self.jobs.lock().unwrap().push(job);
-    }
-}
-impl ManualExecutor {
-    fn len(&self) -> usize {
-        self.jobs.lock().unwrap().len()
-    }
-    fn run(&self, index: usize) {
-        let job = self.jobs.lock().unwrap().remove(index);
-        job();
-    }
-    fn run_on_background_thread(&self, index: usize) {
-        let job = self.jobs.lock().unwrap().remove(index);
-        std::thread::spawn(job).join().unwrap();
-    }
-}
 
 struct RecordingProvider {
     calls: RecordedCalls,
