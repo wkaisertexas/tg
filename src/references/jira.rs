@@ -5,6 +5,7 @@ use super::model::{
     QueryRequest, QueryScope, ReferenceCandidate, ReferenceKind, ReferenceTarget, ValidatedTarget,
 };
 use super::process::{ProcessError, ProcessRequest, run_per_stream};
+use super::syntax::jira_key_for;
 use super::{CancellationFlag, ReferenceProvider};
 use crate::config::JiraProviderConfig;
 use anyhow::{Context, Result, bail, ensure};
@@ -65,18 +66,10 @@ impl JiraProvider {
     }
 
     fn normalized_query(&self, query: &str) -> QueryKind {
-        let query = query.trim();
-        if !query.is_empty()
-            && query.bytes().all(|byte| byte.is_ascii_digit())
-            && let Some(prefix) = &self.key_prefix
-        {
-            return QueryKind::Key(format!("{prefix}-{query}"));
-        }
-        if is_issue_key(query) {
-            QueryKind::Key(query.to_owned())
-        } else {
-            QueryKind::Search(query.to_owned())
-        }
+        jira_key_for(query, self.key_prefix.as_deref()).map_or_else(
+            || QueryKind::Search(query.trim().to_owned()),
+            QueryKind::Key,
+        )
     }
 
     fn execute_query(
@@ -282,19 +275,6 @@ impl QueryKind {
             Self::Key(key) | Self::Search(key) => key,
         }
     }
-}
-
-fn is_issue_key(query: &str) -> bool {
-    let Some((project, number)) = query.rsplit_once('-') else {
-        return false;
-    };
-    let mut project_chars = project.chars();
-    project_chars
-        .next()
-        .is_some_and(|character| character.is_ascii_alphabetic())
-        && project_chars.all(|character| character.is_ascii_alphanumeric())
-        && !number.is_empty()
-        && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn search_jql(text: &str) -> String {
@@ -537,6 +517,41 @@ esac
             ..JiraProviderConfig::default()
         };
         (temp, JiraProvider::new(&config, "&").unwrap())
+    }
+
+    #[test]
+    fn query_normalization_keeps_ascii_keys_distinct_from_trimmed_searches() {
+        for prefix in [None, Some("G5")] {
+            let config = JiraProviderConfig {
+                key_prefix: prefix.map(str::to_owned),
+                ..JiraProviderConfig::default()
+            };
+            let provider = JiraProvider::new(&config, "&").unwrap();
+            for query in [
+                "Other-007",
+                "A-0",
+                " 123 ",
+                " ",
+                "OPS-١",
+                "Å-1",
+                "A_B-2",
+                "AB--2",
+                " text with spaces ",
+            ] {
+                let expected = match query {
+                    "Other-007" | "A-0" => Some(query.to_owned()),
+                    " 123 " => prefix.map(|prefix| format!("{prefix}-123")),
+                    _ => None,
+                };
+                match provider.normalized_query(query) {
+                    QueryKind::Key(key) => assert_eq!(Some(key), expected, "{query:?}"),
+                    QueryKind::Search(text) => {
+                        assert!(expected.is_none(), "{query:?}");
+                        assert_eq!(text, query.trim());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

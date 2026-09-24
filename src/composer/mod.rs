@@ -2,10 +2,12 @@ use crate::config::Config;
 use crate::language;
 use crate::references::activation::lower_snapshot;
 use crate::references::model::{
-    CompletionActivation, FileOrigin, GenerationId, LoweredReference, QueryRequest, QueryScope,
-    ReferenceCandidate, ReferenceId, ReferenceKind, ReferenceTarget, ResolvedReference, TextRange,
+    CompletionActivation, GenerationId, LoweredReference, QueryRequest, ReferenceCandidate,
+    ReferenceId, ReferenceKind, ReferenceTarget, ResolvedReference, SharedProvider, TextRange,
 };
-use crate::references::model::{SharedProvider, char_to_byte};
+use crate::references::syntax::{
+    activation_for, char_slice, is_token_boundary, jira_key_for, sorted_leaders,
+};
 use crate::references::{CancellationFlag, ReferenceProvider};
 use crate::repository::Repository;
 use anyhow::{Context, Result, bail};
@@ -69,13 +71,9 @@ pub fn resolve_prompt_with_config(
                 activation.query
             );
         };
-        let friendly_text = char_slice(
-            prompt,
-            activation.replacement_range.start,
-            activation.replacement_range.end,
-        )
-        .context("reference range is outside the prompt")?
-        .to_owned();
+        let friendly_text = char_slice(prompt, activation.replacement_range)
+            .context("reference range is outside the prompt")?
+            .to_owned();
         references.push(ResolvedReference {
             id: ReferenceId(index as u64 + 1),
             range: activation.replacement_range,
@@ -256,52 +254,25 @@ fn symbol_name_matches(name: &str, query: &str) -> bool {
     }
 }
 
-fn jira_key_for(query: &str, prefix: Option<&str>) -> Option<String> {
-    // Jira direct-key queries return exactly one candidate. This helper keeps
-    // text searches interactive-only without depending on provider internals.
-    let query = query.trim();
-    if is_jira_key(query) {
-        Some(query.to_owned())
-    } else if !query.is_empty() && query.bytes().all(|byte| byte.is_ascii_digit()) {
-        prefix.map(|prefix| format!("{prefix}-{query}"))
-    } else {
-        None
-    }
-}
-
-fn is_jira_key(query: &str) -> bool {
-    let Some((project, number)) = query.rsplit_once('-') else {
-        return false;
-    };
-    project
-        .chars()
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic())
-        && project
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric())
-        && !number.is_empty()
-        && number.bytes().all(|byte| byte.is_ascii_digit())
-}
-
 fn scan_activations(
     prompt: &str,
     config: &Config,
     search_root: &Path,
 ) -> Result<Vec<CompletionActivation>> {
-    let leaders = sorted_leaders(config);
+    let leaders = sorted_leaders(&config.leaders);
     let characters: Vec<(usize, char)> = prompt.char_indices().collect();
     let mut activations = Vec::new();
     let mut character_index = 0;
     while character_index < characters.len() {
         let (start_byte, _) = characters[character_index];
-        if !is_boundary(prompt, start_byte) {
+        if !is_token_boundary(prompt, start_byte) {
             character_index += 1;
             continue;
         }
         let Some((leader, kind)) = leaders
             .iter()
-            .find(|(leader, _)| prompt[start_byte..].starts_with(leader))
+            .copied()
+            .find(|(leader, _)| prompt[start_byte..].starts_with(*leader))
         else {
             character_index += 1;
             continue;
@@ -311,7 +282,7 @@ fn scan_activations(
         while end_character < characters.len() {
             let end_byte = characters[end_character].0;
             let token = &prompt[start_byte..end_byte];
-            let symbol_stage = *kind == ReferenceKind::Symbol
+            let symbol_stage = kind == ReferenceKind::Symbol
                 || matches!(kind, ReferenceKind::GitFile | ReferenceKind::BroadFile)
                     && token[leader.len()..].contains(&config.leaders.symbols);
             if is_headless_terminator(characters[end_character].1, symbol_stage) {
@@ -327,15 +298,15 @@ fn scan_activations(
             .get(end_character)
             .map_or(prompt.len(), |(byte, _)| *byte);
         let token = &prompt[start_byte..token_end_byte];
-        let mut activation = headless_activation(
-            *kind,
+        let mut activation = activation_for(
+            kind,
             leader,
             &token[leader.len()..],
             TextRange {
                 start: character_index,
                 end: end_character,
             },
-            config,
+            &config.leaders,
             search_root,
         );
         normalize_sentence_period(&mut activation, search_root);
@@ -343,46 +314,6 @@ fn scan_activations(
         character_index = end_character;
     }
     Ok(activations)
-}
-
-fn headless_activation(
-    kind: ReferenceKind,
-    leader: &str,
-    query: &str,
-    replacement_range: TextRange,
-    config: &Config,
-    search_root: &Path,
-) -> CompletionActivation {
-    if matches!(kind, ReferenceKind::GitFile | ReferenceKind::BroadFile)
-        && let Some((relative_path, symbol_query)) = query.split_once(&config.leaders.symbols)
-        && !relative_path.is_empty()
-    {
-        return CompletionActivation {
-            kind: ReferenceKind::Symbol,
-            replacement_range,
-            query: symbol_query.to_owned(),
-            scope: QueryScope::File {
-                path: search_root.join(relative_path),
-                origin: if kind == ReferenceKind::GitFile {
-                    FileOrigin::GitAware
-                } else {
-                    FileOrigin::Broad
-                },
-            },
-            typed_leader: leader.to_owned(),
-        };
-    }
-    CompletionActivation {
-        kind,
-        replacement_range,
-        query: query.to_owned(),
-        scope: QueryScope::Repository,
-        typed_leader: if kind == ReferenceKind::Symbol {
-            String::new()
-        } else {
-            leader.to_owned()
-        },
-    }
 }
 
 fn normalize_sentence_period(activation: &mut CompletionActivation, search_root: &Path) {
@@ -400,31 +331,6 @@ fn normalize_sentence_period(activation: &mut CompletionActivation, search_root:
     activation.replacement_range.end = activation.replacement_range.end.saturating_sub(1);
 }
 
-fn sorted_leaders(config: &Config) -> Vec<(String, ReferenceKind)> {
-    let leaders = &config.leaders;
-    let mut values = vec![
-        (leaders.files.clone(), ReferenceKind::GitFile),
-        (leaders.broad_files.clone(), ReferenceKind::BroadFile),
-        (leaders.symbols.clone(), ReferenceKind::Symbol),
-        (leaders.skills.clone(), ReferenceKind::Skill),
-        (leaders.github_issues.clone(), ReferenceKind::GitHubIssue),
-        (
-            leaders.github_pull_requests.clone(),
-            ReferenceKind::GitHubPullRequest,
-        ),
-        (leaders.jira_issues.clone(), ReferenceKind::JiraIssue),
-    ];
-    values.sort_by_key(|(leader, _)| std::cmp::Reverse((leader.chars().count(), leader.len())));
-    values
-}
-
-fn is_boundary(text: &str, byte: usize) -> bool {
-    byte == 0
-        || text[..byte].chars().next_back().is_some_and(|character| {
-            character.is_whitespace() || matches!(character, '(' | '[' | '{' | '<' | '"' | '\'')
-        })
-}
-
 fn is_headless_terminator(character: char, symbol_stage: bool) -> bool {
     character.is_whitespace()
         || if symbol_stage {
@@ -435,12 +341,6 @@ fn is_headless_terminator(character: char, symbol_stage: bool) -> bool {
                 ',' | ';' | '!' | '?' | ')' | ']' | '}' | '>' | '"' | '\''
             )
         }
-}
-
-fn char_slice(text: &str, start: usize, end: usize) -> Option<&str> {
-    let start = char_to_byte(text, start)?;
-    let end = char_to_byte(text, end)?;
-    text.get(start..end)
 }
 
 fn kind_name(kind: ReferenceKind) -> &'static str {
@@ -459,6 +359,8 @@ fn kind_name(kind: ReferenceKind) -> &'static str {
 mod tests {
     use super::*;
     use std::fs;
+
+    mod parsing;
 
     #[cfg(unix)]
     fn executable(path: &Path, source: &str) {

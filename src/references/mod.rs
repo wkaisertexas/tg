@@ -10,6 +10,7 @@ pub(crate) mod process;
 pub mod session;
 pub mod skill;
 pub mod symbol;
+pub(crate) mod syntax;
 
 use anyhow::Result;
 use model::{

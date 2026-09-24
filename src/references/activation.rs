@@ -1,13 +1,9 @@
 use super::model::char_to_byte;
-use super::model::{
-    CompletionActivation, FileOrigin, LoweredReference, ReferenceKind, ResolvedReference, TextRange,
-};
+use super::model::{CompletionActivation, LoweredReference, ResolvedReference, TextRange};
+use super::syntax::{activation_for, char_slice, is_token_boundary, sorted_leaders};
 use crate::config::LeadersConfig;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
-
-/// Opening delimiters which permit a leader to begin a reference token.
-const OPENING_DELIMITERS: &[char] = &['(', '[', '{', '<', '"', '\''];
 
 /// Find the active reference query ending at `cursor`, which is measured in
 /// Unicode scalar values rather than UTF-8 bytes.
@@ -26,7 +22,7 @@ pub fn detect_activation(
         if !is_token_boundary(prefix, start_byte) {
             continue;
         }
-        for (leader, kind) in &leader_specs {
+        for &(leader, kind) in &leader_specs {
             let after_leader = start_byte + leader.len();
             if after_leader > prefix.len() || !prefix[start_byte..].starts_with(leader) {
                 continue;
@@ -37,64 +33,19 @@ pub fn detect_activation(
             }
             let replacement_range = TextRange::new(byte_to_char(text, start_byte), cursor)?;
             active = Some(activation_for(
-                *kind,
+                kind,
                 leader,
                 query,
                 replacement_range,
                 leaders,
                 search_root,
-            )?);
+            ));
             // Leaders are ordered longest-first, so the first match at a
             // given position is the only unambiguous one.
             break;
         }
     }
     Ok(active)
-}
-
-fn activation_for(
-    kind: ReferenceKind,
-    typed_leader: &str,
-    query: &str,
-    replacement_range: TextRange,
-    leaders: &LeadersConfig,
-    search_root: &Path,
-) -> Result<CompletionActivation> {
-    if matches!(kind, ReferenceKind::GitFile | ReferenceKind::BroadFile)
-        && let Some((relative_path, symbol_query)) = query.split_once(&leaders.symbols)
-        && !relative_path.is_empty()
-    {
-        return Ok(CompletionActivation {
-            kind: ReferenceKind::Symbol,
-            replacement_range,
-            query: symbol_query.into(),
-            scope: super::model::QueryScope::File {
-                path: search_root.join(relative_path),
-                origin: if kind == ReferenceKind::GitFile {
-                    FileOrigin::GitAware
-                } else {
-                    FileOrigin::Broad
-                },
-            },
-            // Symbol candidates need the original file leader so accepting a
-            // broad-file symbol remains `%path::name` rather than `@path::name`.
-            typed_leader: typed_leader.into(),
-        });
-    }
-
-    Ok(CompletionActivation {
-        kind,
-        replacement_range,
-        query: query.into(),
-        scope: super::model::QueryScope::Repository,
-        // Standalone symbol results lower through their containing file and
-        // therefore use the SymbolProvider's configured file leader.
-        typed_leader: if kind == ReferenceKind::Symbol {
-            String::new()
-        } else {
-            typed_leader.into()
-        },
-    })
 }
 
 /// A character-indexed replacement used at the editor boundary.
@@ -207,7 +158,7 @@ fn escaped_leader_replacements(
         let after_slash = slash_byte + character.len_utf8();
         if leader_specs
             .iter()
-            .any(|(leader, _)| text[after_slash..].starts_with(leader))
+            .any(|(leader, _)| text[after_slash..].starts_with(*leader))
         {
             let slash_char = byte_to_char(text, slash_byte);
             if !references.iter().any(|reference| {
@@ -226,36 +177,6 @@ fn escaped_leader_replacements(
     replacements
 }
 
-fn sorted_leaders(leaders: &LeadersConfig) -> Vec<(String, ReferenceKind)> {
-    let mut values = vec![
-        (leaders.files.clone(), ReferenceKind::GitFile),
-        (leaders.broad_files.clone(), ReferenceKind::BroadFile),
-        (leaders.symbols.clone(), ReferenceKind::Symbol),
-        (leaders.skills.clone(), ReferenceKind::Skill),
-        (leaders.github_issues.clone(), ReferenceKind::GitHubIssue),
-        (
-            leaders.github_pull_requests.clone(),
-            ReferenceKind::GitHubPullRequest,
-        ),
-        (leaders.jira_issues.clone(), ReferenceKind::JiraIssue),
-    ];
-    values.sort_by(|(left, _), (right, _)| {
-        right
-            .chars()
-            .count()
-            .cmp(&left.chars().count())
-            .then_with(|| right.len().cmp(&left.len()))
-    });
-    values
-}
-
-fn is_token_boundary(text: &str, byte: usize) -> bool {
-    byte == 0
-        || text[..byte].chars().next_back().is_some_and(|character| {
-            character.is_whitespace() || OPENING_DELIMITERS.contains(&character)
-        })
-}
-
 fn is_token_terminator(character: char) -> bool {
     character.is_whitespace() || matches!(character, ')' | ']' | '}' | '>' | '"' | '\'')
 }
@@ -264,17 +185,12 @@ fn byte_to_char(text: &str, byte: usize) -> usize {
     text[..byte].chars().count()
 }
 
-fn char_slice(text: &str, range: TextRange) -> Option<&str> {
-    let start = char_to_byte(text, range.start)?;
-    let end = char_to_byte(text, range.end)?;
-    text.get(start..end)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::references::model::{
-        ContextCost, ReferenceId, ReferenceTarget, SkillTarget, ValidatedTarget,
+        ContextCost, FileOrigin, ReferenceId, ReferenceKind, ReferenceTarget, SkillTarget,
+        ValidatedTarget,
     };
     use std::path::PathBuf;
 
